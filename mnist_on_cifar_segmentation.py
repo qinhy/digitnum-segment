@@ -52,12 +52,12 @@ class AugDataset(Dataset):
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
             A.RandomRotate90(p=0.5),
-            A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.5),
+            A.GridDistortion(num_steps=5, distort_limit=(0.3, 0.3), p=0.7),
 
             A.CoarseDropout(
                 num_holes_range=(1, 10),
-                hole_height_range=(IMAGE_SIZE//10, IMAGE_SIZE//5),
-                hole_width_range=(IMAGE_SIZE//10, IMAGE_SIZE//5),
+                hole_height_range=(IMAGE_SIZE//10, IMAGE_SIZE//3),
+                hole_width_range=(IMAGE_SIZE//10, IMAGE_SIZE//3),
                 fill=0,
                 p=0.5
             ),
@@ -486,7 +486,7 @@ def iou_score(pred, target, threshold=0.5, eps=1e-6):
 
 if __name__ == "__main__":    
     encoder_name='timm-efficientnet-b0'
-    epochs=100
+    epochs=500
     batch_size=32
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
