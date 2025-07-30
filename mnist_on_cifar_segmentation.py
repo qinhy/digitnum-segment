@@ -1,4 +1,5 @@
 from typing import Optional, Sequence
+import cv2
 import torch
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
@@ -225,7 +226,12 @@ class TwoImagesSegmentationDataset(AugDataset):
         mask_img = mask_img.resize((IMAGE_SIZE,IMAGE_SIZE))
         input_img = np.asarray(input_img).copy().astype(np.uint8)
         mask_img = np.asarray(mask_img).copy().astype(np.uint8)
+
+        # mask_img = ((mask_img-mask_img.min())/(mask_img.max()-mask_img.min())*255.0).astype(np.uint8)
         mask_img  = ((mask_img > 0)*255.0).astype(np.uint8)
+        mask_img = cv2.erode(mask_img, (5, 5), iterations=3)
+        mask_img = cv2.GaussianBlur(mask_img, (5, 5), sigmaX=0)
+        mask_img = cv2.GaussianBlur(mask_img, (5, 5), sigmaX=0)
         return input_img,mask_img
     
     @staticmethod
@@ -498,8 +504,8 @@ if __name__ == "__main__":
         
     # images, masks = next(iter(real_loader))
     # plot(images[:5], masks[:5])
-    # images, masks = next(iter(train_loader))
-    # plot(images[:5], masks[:5])
+    images, masks = next(iter(train_loader))
+    plot(images[:5], masks[:5])
     # images, masks = next(iter(val_loader))
     # plot(images[:5], masks[:5])
     
@@ -518,7 +524,6 @@ if __name__ == "__main__":
     # model.to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
-
     model.to(device)
     loss_fn = nn.BCEWithLogitsLoss()
 
@@ -537,6 +542,7 @@ if __name__ == "__main__":
     
     print(f"save unet_{encoder_name}_ep{epochs}.pth")
     torch.save(model.state_dict(), f"unet_{encoder_name}_ep{epochs}.pth")
+
     print(f"load unet_{encoder_name}_ep{epochs}.pth")
     model.load_state_dict(torch.load(f"unet_{encoder_name}_ep{epochs}.pth",weights_only=True))
     model.to(device)
@@ -547,7 +553,7 @@ if __name__ == "__main__":
     model.eval()
     with torch.no_grad():
         pred = model(test_inputs)
-        pred_binary = (torch.sigmoid(pred > 0.5)).float()
+        pred_binary = (torch.sigmoid(pred > 0.99)).float()
         plot(test_inputs, test_masks, pred_binary)
 
 # if __name__ == "__main__":
