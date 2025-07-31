@@ -1,30 +1,46 @@
+# Standard libraries
+import os
+import time
+import random
+import ssl
 from typing import Optional, Sequence
+
+# Image handling and visualization
 import cv2
-import torch
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from torchvision import datasets, transforms
-import torch.nn as nn
-import torch.nn.functional as F
-from torchvision.datasets import CIFAR10
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-from torchvision import transforms as T
 import numpy as np
 from PIL import Image
-import random
 import matplotlib.pyplot as plt
-from torch.utils.data import Dataset
-from torchvision import transforms
-from PIL import Image
-import os
-import ssl
+
+# PyTorch core
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import torch.optim as optim
+
+# TorchVision
+from torchvision import datasets, transforms as T
+from torchvision.datasets import CIFAR10
+
+# Albumentations for augmentation
+import albumentations as A
+
+# PyTorch Lightning
+import pytorch_lightning as pl
+from pytorch_lightning import Trainer
+from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.loggers import CSVLogger
+
+# Segmentation Models
+import segmentation_models_pytorch as smp
+
+
+torch.set_float32_matmul_precision('medium')
 ssl._create_default_https_context = ssl._create_unverified_context
 
 
 # --- Configuration ---
 IMAGE_SIZE = 224
-
 
 # --- Dataset ---
 class AugDataset(Dataset):
@@ -46,8 +62,7 @@ class AugDataset(Dataset):
             A.Affine(
                 rotate=(-25, 25),             # Arbitrary rotation range
                 translate_percent={"x": (-0.5, 0.5), "y": (-0.5, 0.5)},  # Up to ±20% shift
-                scale=(0.5, 2.0),             # Slight zoom in/out
-                shear=(-10, 10),              # Optional: slight shearing
+                scale=(0.8, 1.2),             # Slight zoom in/out
                 p=0.7
             ),
             A.HorizontalFlip(p=0.5),
@@ -55,12 +70,20 @@ class AugDataset(Dataset):
             A.RandomRotate90(p=0.5),
             A.GridDistortion(num_steps=5, distort_limit=(0.3, 0.3), p=0.7),
 
+            # A.CoarseDropout(
+            #     num_holes_range=(1, 10),
+            #     hole_height_range=(IMAGE_SIZE//10, IMAGE_SIZE//3),
+            #     hole_width_range=(IMAGE_SIZE//10, IMAGE_SIZE//3),
+            #     fill=0,
+            #     p=0.5
+            # ),
+
             A.CoarseDropout(
-                num_holes_range=(1, 10),
-                hole_height_range=(IMAGE_SIZE//10, IMAGE_SIZE//3),
-                hole_width_range=(IMAGE_SIZE//10, IMAGE_SIZE//3),
+                num_holes_range=(100, 200),
+                hole_height_range=(IMAGE_SIZE//100, IMAGE_SIZE//50),
+                hole_width_range=(IMAGE_SIZE//100, IMAGE_SIZE//50),
                 fill=0,
-                p=0.5
+                p=0.9
             ),
 
             A.GaussianBlur(p=0.5),
@@ -77,17 +100,6 @@ class AugDataset(Dataset):
         ])
 
         self.no_aug = A.Compose([
-            # A.Affine(
-            #     rotate=(-25, 25),             # Arbitrary rotation range
-            #     translate_percent={"x": (-0.5, 0.5), "y": (-0.5, 0.5)},  # Up to ±20% shift
-            #     scale=(0.5, 2.0),             # Slight zoom in/out
-            #     shear=(-10, 10),              # Optional: slight shearing
-            #     p=0.7
-            # ),
-            # A.HorizontalFlip(p=0.5),
-            # A.VerticalFlip(p=0.2),
-            # A.RandomRotate90(p=0.5),
-            # A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.5),
             # A.Normalize(mean=0.0, std=1.0),
             # AugDataset.ToUint8(),
         ])
@@ -188,7 +200,7 @@ class TwoImagesSegmentationDataset(AugDataset):
         train=False,
         exts: Sequence[str] = ('.png', '.jpg', '.jpeg', '.tif'),
         image_size: int = IMAGE_SIZE,
-        mixup=True, cutmix=True):
+        mixup=True, cutmix=True, in_memory=True):
 
         super().__init__(train, mixup, cutmix)
         self.image_dir = image_dir
@@ -213,6 +225,16 @@ class TwoImagesSegmentationDataset(AugDataset):
         # Store the resolved pairs
         self.inputnames = {k: inputnames[k] for k in self.keys}
         self.masknames  = {k: masknames[k] for k in self.keys}
+        self.in_memory = in_memory
+        if in_memory:
+            self.input_imgs = [Image.open(os.path.join(self.image_dir, 
+                                    self.inputnames[k])
+                                    ).convert('L').resize((IMAGE_SIZE,IMAGE_SIZE)) for k in self.keys]
+            self.mask_imgs  = [Image.open(os.path.join(self.image_dir, 
+                                    self.masknames[k])
+                                    ).convert('L').resize((IMAGE_SIZE,IMAGE_SIZE)) for k in self.keys]
+            self.input_imgs = [np.asarray(i).copy().astype(np.uint8) for i in self.input_imgs]
+            self.mask_imgs = [np.asarray(i).copy().astype(np.uint8) for i in self.mask_imgs]
 
     def __len__(self):
         return len(self.keys)
@@ -220,18 +242,19 @@ class TwoImagesSegmentationDataset(AugDataset):
     def _build_sample(self, idx):
         k = self.keys[idx]
         # Load PIL
-        input_img = Image.open(os.path.join(self.image_dir, self.inputnames[k])).convert('L')
-        mask_img  = Image.open(os.path.join(self.image_dir, self.masknames[k])).convert('L')
-        input_img = input_img.resize((IMAGE_SIZE,IMAGE_SIZE))
-        mask_img = mask_img.resize((IMAGE_SIZE,IMAGE_SIZE))
-        input_img = np.asarray(input_img).copy().astype(np.uint8)
-        mask_img = np.asarray(mask_img).copy().astype(np.uint8)
+        if self.in_memory:
+            input_img = self.input_imgs[idx]
+            mask_img  = self.mask_imgs[idx]
+        else:
+            input_img = Image.open(os.path.join(self.image_dir, self.inputnames[k])).convert('L')
+            mask_img  = Image.open(os.path.join(self.image_dir, self.masknames[k])).convert('L')
+            input_img = input_img.resize((IMAGE_SIZE,IMAGE_SIZE))
+            mask_img = mask_img.resize((IMAGE_SIZE,IMAGE_SIZE))
+            input_img = np.asarray(input_img).copy().astype(np.uint8)
+            mask_img = np.asarray(mask_img).copy().astype(np.uint8)
 
         # mask_img = ((mask_img-mask_img.min())/(mask_img.max()-mask_img.min())*255.0).astype(np.uint8)
         mask_img  = ((mask_img > 0)*255.0).astype(np.uint8)
-        mask_img = cv2.erode(mask_img, (5, 5), iterations=3)
-        mask_img = cv2.GaussianBlur(mask_img, (5, 5), sigmaX=0)
-        mask_img = cv2.GaussianBlur(mask_img, (5, 5), sigmaX=0)
         return input_img,mask_img
     
     @staticmethod
@@ -266,9 +289,13 @@ class SideBySideSegmentationDataset(AugDataset):
         train=False,
         exts: Sequence[str] = ('.png', '.jpg', '.jpeg', '.tif'),
         image_size: int = IMAGE_SIZE,
+        color: str = 'L',
         mixup=False, cutmix=False):
         super().__init__(train, mixup, cutmix)
+
         self.image_dir = image_dir
+        self.image_size = image_size
+        self.color = color
         self.exts = tuple(e.lower() for e in exts)        
         self.filenames = [f for f in os.listdir(image_dir) if f.lower().endswith(self.exts)]
 
@@ -277,18 +304,18 @@ class SideBySideSegmentationDataset(AugDataset):
     
     def _build_sample(self, idx):
         image_path = os.path.join(self.image_dir, self.filenames[idx])
-        full_img = Image.open(image_path).convert('RGB')
+        full_img = Image.open(image_path).convert(self.color)
         w,h = full_img.size
 
         # Crop left and right halves
         input_img = full_img.crop((0, 0, w//2, h))
         mask_img  = full_img.crop((w//2, 0, w, h))
 
-        input_img = input_img.resize((IMAGE_SIZE,IMAGE_SIZE))
-        mask_img  = mask_img.resize((IMAGE_SIZE,IMAGE_SIZE))        
+        input_img = input_img.resize((self.image_size,self.image_size))
+        mask_img  = mask_img.resize((self.image_size,self.image_size))        
         
-        input_img = np.asarray(input_img)[:,:,1].astype(np.uint8)
-        mask_img  = np.asarray(mask_img)[:,:,1].astype(np.uint8)
+        input_img = np.asarray(input_img).copy().astype(np.uint8)
+        mask_img  = np.asarray(mask_img).copy().astype(np.uint8)
 
         # Normalize mask to binary
         # mask_img  = ((mask_img > 0)*255.0).astype(np.uint8)
@@ -310,146 +337,123 @@ class SideBySideSegmentationDataset(AugDataset):
         )
         return data_loader
     
-class SimpleUNet(nn.Module):
-    class DoubleConv(nn.Module):
-        def __init__(self, in_ch, out_ch):
+class SegmentationModel(pl.LightningModule):
+
+    class BCEDiceLoss(nn.Module):
+        def __init__(self):
             super().__init__()
-            self.net = nn.Sequential(
-                nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
-                # nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
-                # nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
-            )
+            self.bce = nn.BCEWithLogitsLoss()
 
-        def forward(self, x):
-            return self.net(x)
-
-    def __init__(self, in_channels=1, out_channels=1, features=[32, 64, 128]):
-        """
-        Args:
-            in_channels (int): number of input image channels
-            out_channels (int): number of output segmentation channels
-            features (list): number of feature maps at each encoder level
-        """
+        def forward(self, logits, targets):
+            bce_loss = self.bce(logits, targets)
+            preds = torch.sigmoid(logits)
+            smooth = 1e-6
+            intersection = (preds * targets).sum()
+            union = preds.sum() + targets.sum()
+            dice = (2. * intersection + smooth) / (union + smooth)
+            return bce_loss + (1 - dice)
+        
+    def __init__(self, arch_name='Segformer', encoder_name='efficientnet-b7', lr=1e-4):
         super().__init__()
-        assert len(features) >= 2, "At least 2 levels (encoder + bottleneck) are required."
+        self.save_hyperparameters()
 
-        self.enc_blocks = nn.ModuleList()
-        self.pools = nn.ModuleList()
-        self.dec_ups = nn.ModuleList()
-        self.dec_blocks = nn.ModuleList()
+        self.model = smp.__dict__[arch_name](
+            encoder_name=encoder_name,
+            encoder_weights='imagenet',
+            in_channels=1,
+            classes=1,
+        )
 
-        # Encoder
-        prev_channels = in_channels
-        for feature in features:
-            self.enc_blocks.append(SimpleUNet.DoubleConv(prev_channels, feature))
-            self.pools.append(nn.MaxPool2d(kernel_size=2, stride=2))
-            prev_channels = feature
-
-        # Bottleneck
-        self.bottleneck = SimpleUNet.DoubleConv(prev_channels, prev_channels * 2)
-
-        # Decoder (reverse order)
-        reversed_features = features[::-1]
-        curr_channels = prev_channels * 2
-        for feature in reversed_features:
-            self.dec_ups.append(nn.ConvTranspose2d(curr_channels, feature, kernel_size=2, stride=2))
-            self.dec_blocks.append(SimpleUNet.DoubleConv(curr_channels, feature))
-            curr_channels = feature
-
-        # Output layer
-        self.final_conv = nn.Conv2d(curr_channels, out_channels, kernel_size=1)
+        # self.loss_fn = nn.BCEWithLogitsLoss()
+        self.loss_fn = SegmentationModel.BCEDiceLoss()
+        self.lr = lr
 
     def forward(self, x):
-        enc_features = []
+        return self.model(x)
 
-        # Encoder
-        for enc, pool in zip(self.enc_blocks, self.pools):
-            x = enc(x)
-            enc_features.append(x)
-            x = pool(x)
+    def _shared_step(self, batch, stage):
+        images, masks = batch
+        logits = self(images)
+        loss = self.loss_fn(logits, masks)
 
-        # Bottleneck
-        x = self.bottleneck(x)
+        preds = torch.sigmoid(logits)
+        preds_bin = (preds > 0.5).float()
+        iou = self._iou_score(preds_bin, masks)
 
-        # Decoder
-        for up, dec, skip in zip(self.dec_ups, self.dec_blocks, reversed(enc_features)):
-            x = up(x)
-            x = torch.cat([x, skip], dim=1)
-            x = dec(x)
-
-        return self.final_conv(x)  # Raw logits
-    
-    def infer(self, imgs, conf: float | None = 0.5):
-        self.eval()
-        with torch.no_grad():
-            x = torch.stack(list(imgs)).to(next(self.parameters()).device)
-            probs = torch.sigmoid(self(x))
-            if conf is None:
-                return probs.cpu()
-            return (probs > conf).float().cpu()
-    
-    def save_model(self, path="mnist_on_cifar_unet.pth"):
-        torch.save(self.state_dict(), path)
-        print(f"✅ Model saved to {path}")
-
-    def load_model(self, path="mnist_on_cifar_unet.pth", device='cuda'):
-        self.load_state_dict(torch.load(path, map_location=device))
-        self.to(device)
-        self.eval()
-        print(f"📥 Model loaded from {path}")
-        return self
-
-    def train_data(self, train_loader, val_loader=None, epochs=5, device='cuda',
-                   criterion = nn.BCELoss()):
-        self.to(device)
-        optimizer = optim.Adam(self.parameters(), lr=1e-3)
+        self.log(f"{stage}_loss", loss, on_epoch=True, prog_bar=True)
+        self.log(f"{stage}_iou", iou, on_epoch=True, prog_bar=True)
+        print()
         
+        return loss
 
-        for epoch in range(epochs):
-            self.train()
-            total_loss = 0.0
+    def training_step(self, batch, batch_idx):
+        return self._shared_step(batch, "train")
 
-            for images, masks in train_loader:
-                optimizer.zero_grad()
-                
-                images, masks = images.to(device), masks.to(device)
-                outputs = self(images)
-                loss = criterion(outputs, masks)
-                
-                loss.backward()
-                optimizer.step()
+    def validation_step(self, batch, batch_idx):
+        self._shared_step(batch, "val")
 
-                total_loss += loss.item()
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+        return optimizer
 
-            avg_loss = total_loss / len(train_loader)
-            print(f"[Epoch {epoch+1}/{epochs}] Loss: {avg_loss:.4f}")
+    def _iou_score(self, preds, targets, eps=1e-6):
+        intersection = (preds * targets).sum(dim=(1, 2, 3))
+        union = (preds + targets - preds * targets).sum(dim=(1, 2, 3))
+        iou = (intersection + eps) / (union + eps)
+        return iou.mean()
 
-            if val_loader:
-                self.validate_data(val_loader, device, criterion=criterion)
+class SegmentationDataModule(pl.LightningDataModule):
+    def __init__(self, train_dir, val_dir, input_prename, mask_prename, batch_size=32, num_workers=4):
+        super().__init__()
+        self.train_dir = train_dir
+        self.val_dir = val_dir
+        self.input_prename = input_prename
+        self.mask_prename = mask_prename
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+
+    def setup(self, stage=None):
+        self.train_dataset = SideBySideSegmentationDataset(
+            image_dir=self.train_dir,
+            train=True
+        )
+        self.val_dataset = SideBySideSegmentationDataset(
+            image_dir=self.train_dir,
+            train=False
+        )
+        # self.train_dataset = TwoImagesSegmentationDataset(
+        #     image_dir=self.train_dir,
+        #     input_prename=self.input_prename,
+        #     mask_prename=self.mask_prename,
+        #     train=True,
+        # )
+        # self.val_dataset = TwoImagesSegmentationDataset(
+        #     image_dir=self.val_dir,
+        #     input_prename=self.input_prename,
+        #     mask_prename=self.mask_prename,
+        #     train=False,
+        # )
+
+    def train_dataloader(self):
+        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True,
+                          num_workers=self.num_workers, pin_memory=True,persistent_workers=True)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False,
+                          num_workers=self.num_workers, pin_memory=True,persistent_workers=True)
     
-    def validate_data(self, val_loader, device, criterion):
-        self.eval()
-        total_loss = 0.0
+    def show_samples(self, split='val', num_samples=5):
+        if split == 'train':
+            loader = self.train_dataloader()
+        elif split == 'val':
+            loader = self.val_dataloader()
+        else:
+            raise ValueError("split must be either 'train' or 'val'")
 
-        with torch.no_grad():
-            for images, masks in val_loader:
+        batch = next(iter(loader))
+        inputs, gts = batch[:2]  # Assuming dataset returns (input, gt, ...)
 
-                images, masks = images.to(device), masks.to(device)
-                outputs = self(images)
-                loss = criterion(outputs, masks)
-
-                total_loss += loss.item()
-                
-            probs = torch.sigmoid(outputs)
-            bin_preds = (probs >0.5).float()
-            batch_iou = ((bin_preds * masks).sum((1,2,3)) /
-                        (bin_preds + masks - bin_preds * masks + 1e-6).sum((1,2,3))).mean()
-            
-        avg_val_loss = total_loss / len(val_loader)
-        print(f"  🔍 Validation Loss: {avg_val_loss:.4f}, batch_iou: {batch_iou:.4f}")
+        plot(inputs[:num_samples], gts[:num_samples])
 
 def plot(inputs, gts, preds=None):
     for i in range(len(inputs)):
@@ -467,138 +471,48 @@ def plot(inputs, gts, preds=None):
         if preds is not None:
             plt.subplot(1, cols, 3); plt.imshow(pred_mask, cmap='gray'); plt.title('Pred'); plt.axis('off')
         plt.tight_layout(); plt.show()
-  
-def dice_loss(pred_probs, target, smooth=1e-6):
-    pred = pred_probs.view(-1)
-    target = target.view(-1)
-    intersection = (pred * target).sum()
-    union = pred.sum() + target.sum()
-    return 1 - (2. * intersection + smooth) / (union + smooth)
 
-def combo_loss(logits, target, bce_logits = nn.BCEWithLogitsLoss(
-        pos_weight=torch.tensor([5.0], device='cuda') )):
-    probs = torch.sigmoid(logits)
-    return dice_loss(probs, target) + bce_logits(logits, target)
+def show_samples(data):
+    data.setup()
+    data.show_samples('train',10)
 
-def iou_score(pred, target, threshold=0.5, eps=1e-6):
-    pred = torch.sigmoid(pred)  # Convert logits to probabilities if needed
-    pred = (pred > threshold).float()  # Binarize predictions
+def train(data,max_epochs=100):
+    arch_name='Segformer'
+    encoder_name="efficientnet-b7"
 
-    intersection = (pred * target).sum(dim=(1,2,3))
-    union = (pred + target - pred * target).sum(dim=(1,2,3))
-    
-    iou = (intersection + eps) / (union + eps)
-    return iou.mean().item()
+    model = SegmentationModel(arch_name=arch_name,encoder_name=encoder_name, lr=1e-4)
+    trainer = Trainer(
+        max_epochs=max_epochs,
+        accelerator="auto",
+        devices=1,
+        logger=CSVLogger(save_dir=f"{arch_name}-{encoder_name}-logs/"),
+        callbacks=[ModelCheckpoint(monitor="val_iou", mode="max")]
+    )
 
-if __name__ == "__main__":    
-    encoder_name='timm-efficientnet-b0'
-    epochs=500
+    trainer.fit(model, datamodule=data)
+
+def infer(ckpt): 
     batch_size=32
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     real_loader = SideBySideSegmentationDataset.get_dataloader('./tmp/real',batch_size=batch_size)
-
-    train_loader, val_loader = TwoImagesSegmentationDataset.get_dataloaders(
-        val_dir='./tmp/sim',train_dir='./tmp/sim',input_prename='viewport_2',mask_prename='viewport_1',
-        batch_size=batch_size)
-        
-    # images, masks = next(iter(real_loader))
-    # plot(images[:5], masks[:5])
-    images, masks = next(iter(train_loader))
-    plot(images[:5], masks[:5])
-    # images, masks = next(iter(val_loader))
-    # plot(images[:5], masks[:5])
-    
-    import segmentation_models_pytorch as smp
-    model = smp.Unet(
-        # encoder_name="resnet34",        # choose from resnet34, efficientnet-b0, etc.
-        # encoder_weights="imagenet",     # use ImageNet pre-trained weights
-        # in_channels=1,                  # input channels (e.g. 3 for RGB)
-        # classes=1,                      # output channels (e.g. 1 for binary segmentation)        
-        encoder_name='timm-efficientnet-b0',
-        encoder_weights='imagenet',
-        in_channels=1,
-        classes=1,
-    )
-    # model.load_state_dict(torch.load(f"unet_{encoder_name}_ep{epochs}.pth",weights_only=True))
-    # model.to(device)
-
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
-    model.to(device)
-    loss_fn = nn.BCEWithLogitsLoss()
-
-    for epoch in range(epochs):
-        model.train()
-        for images, masks in train_loader:
-            images, masks = images.to(device), masks.to(device)
-            preds = model(images)
-            loss = loss_fn(preds, masks)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-        print(f"Epoch {epoch+1}: Loss = {loss.item():.4f}")
-    
-    print(f"save unet_{encoder_name}_ep{epochs}.pth")
-    torch.save(model.state_dict(), f"unet_{encoder_name}_ep{epochs}.pth")
-
-    print(f"load unet_{encoder_name}_ep{epochs}.pth")
-    model.load_state_dict(torch.load(f"unet_{encoder_name}_ep{epochs}.pth",weights_only=True))
-    model.to(device)
-
-    # # # Test and visualize
-    test_inputs, test_masks = next(iter(real_loader))
-    test_inputs, test_masks = test_inputs.to(device), test_masks.to(device)
+    model = SegmentationModel.load_from_checkpoint(ckpt,map_location=torch.device('cpu'))
     model.eval()
     with torch.no_grad():
-        pred = model(test_inputs)
-        pred_binary = (torch.sigmoid(pred > 0.99)).float()
-        plot(test_inputs, test_masks, pred_binary)
+        test_inputs, test_masks = next(iter(real_loader))
+        test_inputs = test_inputs.to(model.device)
+        pred_logits = model(test_inputs)
+        pred_masks = (torch.sigmoid(pred_logits) > 0.5).float()
+        plot(test_inputs, test_masks, pred_masks)
 
-# if __name__ == "__main__":
-#     epochs=10
-#     batch_size=64
-
-#     # train_loader, val_loader = MNISTOnCIFARSegmentation.get_dataloaders(batch_size=batch_size)
-
-#     train_loader, val_loader = TwoImagesSegmentationDataset.get_dataloaders(
-#         val_dir='./tmp/sim',train_dir='./tmp/sim',input_prename='viewport_2 ',mask_prename='viewport_1 ',
-#         batch_size=batch_size)
-        
-#     images, masks = next(iter(train_loader))
-#     plot(images[:5], masks[:5])
-#     images, masks = next(iter(val_loader))
-#     plot(images[:5], masks[:5])
-
-#     lite   = SimpleUNet(features=[16, 32])       # ~lite model
-#     middle = SimpleUNet(features=[32, 64, 128]) # default / middle model
-#     heavy  = SimpleUNet(features=[64, 128, 256, 512]) # deeper, heavy model
-
-#     model = lite #SimpleUNet()
-#     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-#     model.train_data(train_loader, val_loader, epochs=epochs, device=device, #)
-#                      criterion=combo_loss)
-#                     #  criterion=nn.BCEWithLogitsLoss())
-#                     #  criterion=nn.MSELoss())
-#                     #  criterion=nn.L1Loss())
-#                     #  criterion=nn.SmoothL1Loss())
-#     model.save_model()
-
-#     # # Test and visualize
-#     test_inputs, test_masks = next(iter(val_loader))
-#     preds = model.infer(test_inputs[:5])  # Inference on first 5 samples
-#     print(preds.min().item(), preds.max().item(), preds.mean().item())
-#     print(iou_score(preds,test_masks[:5]))
-#     plot(test_inputs[:5], test_masks[:5], preds)
-
-# --- Example Visualization ---
-# if __name__ == '__main__':
-#     train_loader, _ = get_dataloaders(batch_size=4)
-#     images, masks = next(iter(train_loader))
-
-#     # train_loader, val_loader = get_dataloaders(batch_size=32)
-#     # model = SimpleUNet()
-#     # train(model, train_loader, val_loader, epochs=10)
-
-#     plot(images, masks)
+if __name__ == "__main__":
+    batch_size=32
+    data = SegmentationDataModule(
+        train_dir='./tmp/sim2',
+        val_dir='./tmp/sim2',
+        input_prename='viewport_2',
+        mask_prename='viewport_1',
+        batch_size=batch_size,
+    )
+    train(data,1)
+    # show_samples(data)
+    # infer('./logs/lightning_logs/version_1/checkpoints/epoch=12-step=52.ckpt')

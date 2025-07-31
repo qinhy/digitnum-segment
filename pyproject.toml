@@ -16,7 +16,9 @@ dependencies = [
 dev = [
     "ipython>=9.4.0",
     "matplotlib>=3.10.3",
+    "pytorch-lightning>=2.5.2",
     "segmentation-models-pytorch>=0.5.0",
+    "wandb>=0.21.0",
 ]
 
 [tool.uv.sources]
