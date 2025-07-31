@@ -59,12 +59,12 @@ class AugDataset(Dataset):
         self.mixup = mixup
         self.cutmix = cutmix
         self.aug = A.Compose([
-            A.Affine(
-                rotate=(-25, 25),             # Arbitrary rotation range
-                translate_percent={"x": (-0.5, 0.5), "y": (-0.5, 0.5)},  # Up to ±20% shift
-                scale=(0.8, 1.2),             # Slight zoom in/out
-                p=0.7
-            ),
+            # A.Affine(
+            #     rotate=(-25, 25),             # Arbitrary rotation range
+            #     translate_percent={"x": (-0.5, 0.5), "y": (-0.5, 0.5)},  # Up to ±20% shift
+            #     scale=(0.8, 1.2),             # Slight zoom in/out
+            #     p=0.7
+            # ),
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
             A.RandomRotate90(p=0.5),
@@ -86,14 +86,14 @@ class AugDataset(Dataset):
                 p=0.9
             ),
 
-            A.GaussianBlur(p=0.5),
+            # A.GaussianBlur(p=0.5),
             # A.RandomBrightnessContrast(
             #     brightness_limit=(-0.05, 0.05),
             #     contrast_limit=(-0.05, 0.05),
             #     brightness_by_max=True,
             #     ensure_safe_range=True,
             #     p=0.5),
-            A.GaussNoise(std_range=(0.01, 0.05), p=0.5),
+            # A.GaussNoise(std_range=(0.01, 0.05), p=0.5),
 
             # A.Normalize(mean=0.0, std=1.0),
             # AugDataset.ToUint8(),
@@ -344,14 +344,14 @@ class SegmentationModel(pl.LightningModule):
             super().__init__()
             self.bce = nn.BCEWithLogitsLoss()
 
-        def forward(self, logits, targets):
+        def forward(self, logits, targets, smooth = 1e-6):
             bce_loss = self.bce(logits, targets)
             preds = torch.sigmoid(logits)
-            smooth = 1e-6
-            intersection = (preds * targets).sum()
-            union = preds.sum() + targets.sum()
+            intersection = (preds * targets).sum(dim=(1,2,3))
+            union = preds.sum(dim=(1,2,3)) + targets.sum(dim=(1,2,3))
             dice = (2. * intersection + smooth) / (union + smooth)
-            return bce_loss + (1 - dice)
+            dice_loss = 1 - dice
+            return bce_loss + dice_loss.mean()
         
     def __init__(self, arch_name='Segformer', encoder_name='efficientnet-b7', lr=1e-4):
         super().__init__()
@@ -392,9 +392,33 @@ class SegmentationModel(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         self._shared_step(batch, "val")
 
+    def test_step(self, batch, batch_idx):
+        self._shared_step(batch, "test")
+
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
-        return optimizer
+
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',           # since we want to minimize the validation loss
+            factor=0.5,           # reduce LR by half
+            patience=3,           # wait for 3 epochs without improvement
+            verbose=True          # log the LR reduction
+        )
+
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'monitor': 'val_loss',  # this must match the logged metric name
+                'frequency': 1,
+                'interval': 'epoch'     # step the scheduler every epoch
+            }
+        }
+    
+    def on_epoch_end(self):
+        lr = self.trainer.optimizers[0].param_groups[0]['lr']
+        self.log('lr', lr, prog_bar=True)
 
     def _iou_score(self, preds, targets, eps=1e-6):
         intersection = (preds * targets).sum(dim=(1, 2, 3))
@@ -513,6 +537,6 @@ if __name__ == "__main__":
         mask_prename='viewport_1',
         batch_size=batch_size,
     )
-    train(data,1)
+    train(data,100)
     # show_samples(data)
-    # infer('./logs/lightning_logs/version_1/checkpoints/epoch=12-step=52.ckpt')
+    # infer('./Segformer-efficientnet-b7-logs/lightning_logs/version_6/checkpoints/epoch=6-step=1386.ckpt')
