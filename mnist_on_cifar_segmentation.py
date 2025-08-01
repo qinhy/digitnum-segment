@@ -349,26 +349,82 @@ class SideBySideSegmentationDataset(AugDataset):
 class SegmentationModel(pl.LightningModule):
 
     class BCEDiceLoss(nn.Module):
-        def __init__(self):
+        def __init__(self, bce_weight=0.5, dice_weight=0.5):
             super().__init__()
             self.bce = nn.BCEWithLogitsLoss()
+            self.bce_weight = bce_weight
+            self.dice_weight = dice_weight
 
         def forward(self, logits, targets, smooth = 1e-6):
             bce_loss = self.bce(logits, targets)
-            preds = torch.sigmoid(logits)
+            preds = torch.clamp(torch.sigmoid(logits), min=1e-7, max=1 - 1e-7)
             intersection = (preds * targets).sum(dim=(1,2,3))
             union = preds.sum(dim=(1,2,3)) + targets.sum(dim=(1,2,3))
             dice = (2. * intersection + smooth) / (union + smooth)
             dice_loss = 1 - dice
-            return bce_loss + dice_loss.mean()
+            return self.bce_weight * bce_loss + self.dice_weight * dice_loss.mean()
         
+    class FocalDiceLoss(nn.Module):
+        def __init__(self, alpha=0.8, gamma=2.0, dice_weight=0.5):
+            super().__init__()
+            self.alpha = alpha
+            self.gamma = gamma
+            self.dice_weight = dice_weight
+
+        def focal_loss(self, logits, targets):
+            probs = torch.sigmoid(logits)
+            probs = torch.clamp(probs, 1e-7, 1 - 1e-7)
+            pt = probs * targets + (1 - probs) * (1 - targets)
+            w = self.alpha * (1 - pt).pow(self.gamma)
+            return -(w * pt.log()).mean()
+
+        def dice_loss(self, probs, targets, smooth=1e-6):
+            dims = tuple(range(1, probs.dim()))
+            intersection = (probs * targets).sum(dim=dims)
+            union = probs.sum(dim=dims) + targets.sum(dim=dims)
+            dice = (2. * intersection + smooth) / (union + smooth)
+            return 1 - dice.mean()
+
+        def forward(self, logits, targets):
+            probs = torch.sigmoid(logits)
+            fl = self.focal_loss(logits, targets)
+            dl = self.dice_loss(probs, targets)
+            return (1 - self.dice_weight) * fl + self.dice_weight * dl        
+
+    class TverskyDiceLoss(nn.Module):
+        def __init__(self, alpha=0.3, beta=0.7, tversky_weight=0.5, smooth=1e-6):
+            super().__init__()
+            self.alpha = alpha
+            self.beta = beta
+            self.tversky_weight = tversky_weight
+            self.smooth = smooth
+
+        def forward(self, logits, targets):
+            probs = torch.sigmoid(logits)
+            dims = tuple(range(1, logits.dim()))
+
+            # Tversky components
+            tp = (probs * targets).sum(dim=dims)
+            fp = ((1 - targets) * probs).sum(dim=dims)
+            fn = (targets * (1 - probs)).sum(dim=dims)
+
+            tversky = (tp + self.smooth) / (tp + self.alpha * fp + self.beta * fn + self.smooth)
+            tversky_loss = 1 - tversky.mean()
+
+            # Dice component
+            intersection = (probs * targets).sum(dim=dims)
+            union = probs.sum(dim=dims) + targets.sum(dim=dims)
+            dice = (2. * intersection + self.smooth) / (union + self.smooth)
+            dice_loss = 1 - dice.mean()
+
+            # Combined loss
+            return self.tversky_weight * tversky_loss + (1 - self.tversky_weight) * dice_loss
+
     def __init__(self, arch_name='Segformer', encoder_name='efficientnet-b7',
                        encoder_weights='imagenet', in_channels=1, lr=1e-4):
         super().__init__()
         # self.loss_fn = nn.BCEWithLogitsLoss()
         self.loss_fn = SegmentationModel.BCEDiceLoss()
-        # for image segmentation dice loss could be the best first choice
-        # self.loss_fn = smp.losses.DiceLoss(smp.losses.BINARY_MODE, from_logits=True)
         self.arch_name=arch_name
         self.encoder_name=encoder_name
         self.encoder_weights=encoder_weights
@@ -530,16 +586,8 @@ def show_samples(data, num_samples=10):
     data.setup()
     data.show_samples('train',num_samples)
 
-def train(data,max_epochs=100):
+def train(data,encoder_name,encoder_weights,max_epochs=100):
     arch_name='Segformer'
-    
-    # encoder_name,encoder_weights="efficientnet-b7","imagenet"
-    # encoder_name,encoder_weights="mit_b5","imagenet"
-    encoder_name,encoder_weights="resnext101_32x8d","instagram"
-    # encoder_name,encoder_weights="timm-efficientnet-b8","imagenet"
-
-    # encoder_name,encoder_weights="timm-efficientnet-l2","noisy-student"
-
     lr=1e-4
 
     model = SegmentationModel(arch_name,encoder_name,encoder_weights,1,lr)
@@ -555,7 +603,6 @@ def train(data,max_epochs=100):
 
 def infer(ckpt): 
     batch_size=32
-
     real_loader = SideBySideSegmentationDataset.get_dataloader('./tmp/real',batch_size=batch_size)
     model = SegmentationModel.load_from_checkpoint(ckpt,map_location=torch.device('cpu'))
     model.eval()
@@ -567,15 +614,23 @@ def infer(ckpt):
         plot(test_inputs, test_masks, pred_masks)
 
 if __name__ == "__main__":
-    batch_size=32
-    data = SegmentationDataModule(
+    get_data = lambda batch_size:SegmentationDataModule(
         train_dir='./tmp/sim2',
         val_dir='./tmp/sim2',
         input_prename='viewport_2',
         mask_prename='viewport_1',
         batch_size=batch_size,
-        data_step=20,
+        data_step=1,
     )
-    # show_samples(data,30)
-    train(data,100)
-    # infer('Segformer-efficientnet-b7-logs/lightning_logs/version_10/checkpoints/epoch=59-step=11880.ckpt')
+    # show_samples(get_data(32),30)
+    encoder_name,encoder_weights="timm-efficientnet-b8","imagenet"
+    train(get_data(32),encoder_name,encoder_weights,1)
+    exit()
+    # encoder_name,encoder_weights="timm-efficientnet-b8","imagenet"
+    # train(get_data(32),encoder_name,encoder_weights,500)
+
+    encoder_name,encoder_weights="timm-efficientnet-l2","noisy-student"
+    train(get_data(16),encoder_name,encoder_weights,1)
+    # encoder_name,encoder_weights="timm-efficientnet-l2","noisy-student"
+    # train(get_data(16),encoder_name,encoder_weights,500)
+    # infer('Segformer-timm-efficientnet-b8-logs/lightning_logs/version_1/checkpoints/epoch=0-step=31.ckpt')
