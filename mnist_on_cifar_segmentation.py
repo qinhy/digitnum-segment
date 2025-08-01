@@ -65,11 +65,10 @@ class AugDataset(Dataset):
             #     scale=(0.8, 1.2),             # Slight zoom in/out
             #     p=0.7
             # ),
-            A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.5),
-            A.RandomRotate90(p=0.5),
-            A.GridDistortion(num_steps=5, distort_limit=(0.3, 0.3), p=0.7),
-
+            # A.HorizontalFlip(p=0.5),
+            # A.VerticalFlip(p=0.5),
+            # A.RandomRotate90(p=0.5),
+            # A.GridDistortion(num_steps=5, distort_limit=(0.3, 0.3), p=0.7),
             # A.CoarseDropout(
             #     num_holes_range=(1, 10),
             #     hole_height_range=(IMAGE_SIZE//10, IMAGE_SIZE//3),
@@ -78,13 +77,13 @@ class AugDataset(Dataset):
             #     p=0.5
             # ),
 
-            A.CoarseDropout(
-                num_holes_range=(100, 200),
-                hole_height_range=(IMAGE_SIZE//100, IMAGE_SIZE//50),
-                hole_width_range=(IMAGE_SIZE//100, IMAGE_SIZE//50),
-                fill=0,
-                p=0.9
-            ),
+            # A.CoarseDropout(
+            #     num_holes_range=(100, 200),
+            #     hole_height_range=(IMAGE_SIZE//100, IMAGE_SIZE//50),
+            #     hole_width_range=(IMAGE_SIZE//100, IMAGE_SIZE//50),
+            #     fill=0,
+            #     p=0.9
+            # ),
 
             # A.GaussianBlur(p=0.5),
             # A.RandomBrightnessContrast(
@@ -146,8 +145,17 @@ class AugDataset(Dataset):
             mask_tensor = augmented['mask']
             
         input_tensor, mask_tensor = input_tensor.astype(np.uint8), mask_tensor.astype(np.uint8)
-        input_tensor = torch.tensor(input_tensor).float().div(255.0).unsqueeze(0)
-        mask_tensor = torch.tensor(mask_tensor).float().div(255.0).unsqueeze(0)
+
+        if len(input_tensor.shape)==3:
+            input_tensor = torch.from_numpy(input_tensor).float().div(255.0).permute(2, 0, 1)
+        elif len(input_tensor.shape)==2:
+            input_tensor = torch.from_numpy(input_tensor).float().div(255.0).unsqueeze(0)
+            
+        if len(mask_tensor.shape)==3:
+            mask_tensor = torch.from_numpy(mask_tensor).float().div(255.0).permute(2, 0, 1)
+        elif len(mask_tensor.shape)==2:
+            mask_tensor = torch.from_numpy(mask_tensor).float().div(255.0).unsqueeze(0)
+
         return input_tensor, mask_tensor
     
 class MNISTOnCIFARSegmentation(AugDataset):
@@ -290,7 +298,7 @@ class SideBySideSegmentationDataset(AugDataset):
         exts: Sequence[str] = ('.png', '.jpg', '.jpeg', '.tif'),
         image_size: int = IMAGE_SIZE,
         color: str = 'L',
-        mixup=False, cutmix=False):
+        mixup=False, cutmix=False, data_step=1):
         super().__init__(train, mixup, cutmix)
 
         self.image_dir = image_dir
@@ -298,18 +306,19 @@ class SideBySideSegmentationDataset(AugDataset):
         self.color = color
         self.exts = tuple(e.lower() for e in exts)        
         self.filenames = [f for f in os.listdir(image_dir) if f.lower().endswith(self.exts)]
+        self.filenames = [self.filenames[i] for i in range(0,len(self.filenames),data_step)]
 
     def __len__(self):
         return len(self.filenames)
     
     def _build_sample(self, idx):
         image_path = os.path.join(self.image_dir, self.filenames[idx])
-        full_img = Image.open(image_path).convert(self.color)
+        full_img = Image.open(image_path)
         w,h = full_img.size
 
         # Crop left and right halves
-        input_img = full_img.crop((0, 0, w//2, h))
-        mask_img  = full_img.crop((w//2, 0, w, h))
+        input_img = full_img.crop((0, 0, w//2, h)).convert(self.color)
+        mask_img  = full_img.crop((w//2, 0, w, h)).convert('L')
 
         input_img = input_img.resize((self.image_size,self.image_size))
         mask_img  = mask_img.resize((self.image_size,self.image_size))        
@@ -353,22 +362,39 @@ class SegmentationModel(pl.LightningModule):
             dice_loss = 1 - dice
             return bce_loss + dice_loss.mean()
         
-    def __init__(self, arch_name='Segformer', encoder_name='efficientnet-b7', lr=1e-4):
+    def __init__(self, arch_name='Segformer', encoder_name='efficientnet-b7',
+                       encoder_weights='imagenet', in_channels=1, lr=1e-4):
         super().__init__()
-        self.save_hyperparameters()
-
-        self.model = smp.__dict__[arch_name](
-            encoder_name=encoder_name,
-            encoder_weights='imagenet',
-            in_channels=1,
-            classes=1,
-        )
-
         # self.loss_fn = nn.BCEWithLogitsLoss()
         self.loss_fn = SegmentationModel.BCEDiceLoss()
-        self.lr = lr
+        # for image segmentation dice loss could be the best first choice
+        # self.loss_fn = smp.losses.DiceLoss(smp.losses.BINARY_MODE, from_logits=True)
+        self.arch_name=arch_name
+        self.encoder_name=encoder_name
+        self.encoder_weights=encoder_weights
+        self.lr=lr
+        
+        self.save_hyperparameters()
+        self.model = smp.create_model(
+            self.arch_name,
+            self.encoder_name,
+            self.encoder_weights,
+            in_channels=in_channels,
+            classes=1,
+        )
+        # preprocessing parameteres for image
+        params = smp.encoders.get_preprocessing_params(self.encoder_name)
+        std = torch.tensor(params["std"]).view(1, 3, 1, 1)
+        mean = torch.tensor(params["mean"]).view(1, 3, 1, 1)
+        if in_channels==1:
+            std = std.mean(1,keepdim=True)
+            mean = mean.mean(1,keepdim=True)
+        self.register_buffer("std", std)
+        self.register_buffer("mean", mean)
 
-    def forward(self, x):
+    def forward(self, x:torch.Tensor):
+        # normalize image here
+        x = (x - self.mean) / self.std
         return self.model(x)
 
     def _shared_step(self, batch, stage):
@@ -397,24 +423,23 @@ class SegmentationModel(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+        return optimizer
+        # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        #     optimizer,
+        #     mode='min',           # since we want to minimize the validation loss
+        #     factor=0.5,           # reduce LR by half
+        #     patience=3,           # wait for 3 epochs without improvement
+        # )
 
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode='min',           # since we want to minimize the validation loss
-            factor=0.5,           # reduce LR by half
-            patience=3,           # wait for 3 epochs without improvement
-            verbose=True          # log the LR reduction
-        )
-
-        return {
-            'optimizer': optimizer,
-            'lr_scheduler': {
-                'scheduler': scheduler,
-                'monitor': 'val_loss',  # this must match the logged metric name
-                'frequency': 1,
-                'interval': 'epoch'     # step the scheduler every epoch
-            }
-        }
+        # return {
+        #     'optimizer': optimizer,
+        #     'lr_scheduler': {
+        #         'scheduler': scheduler,
+        #         'monitor': 'val_loss',  # this must match the logged metric name
+        #         'frequency': 1,
+        #         'interval': 'epoch'     # step the scheduler every epoch
+        #     }
+        # }
     
     def on_epoch_end(self):
         lr = self.trainer.optimizers[0].param_groups[0]['lr']
@@ -427,7 +452,9 @@ class SegmentationModel(pl.LightningModule):
         return iou.mean()
 
 class SegmentationDataModule(pl.LightningDataModule):
-    def __init__(self, train_dir, val_dir, input_prename, mask_prename, batch_size=32, num_workers=4):
+    def __init__(self, train_dir, val_dir, input_prename, mask_prename,
+                 batch_size=32, num_workers=4,
+                 data_step=1):
         super().__init__()
         self.train_dir = train_dir
         self.val_dir = val_dir
@@ -435,15 +462,18 @@ class SegmentationDataModule(pl.LightningDataModule):
         self.mask_prename = mask_prename
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.data_step = data_step
 
     def setup(self, stage=None):
         self.train_dataset = SideBySideSegmentationDataset(
             image_dir=self.train_dir,
-            train=True
+            train=True,
+            data_step = self.data_step,
         )
         self.val_dataset = SideBySideSegmentationDataset(
             image_dir=self.train_dir,
-            train=False
+            train=False,
+            data_step = self.data_step,
         )
         # self.train_dataset = TwoImagesSegmentationDataset(
         #     image_dir=self.train_dir,
@@ -459,6 +489,7 @@ class SegmentationDataModule(pl.LightningDataModule):
         # )
 
     def train_dataloader(self):
+        # transform = transforms.Compose(transforms.ToTensor()])
         return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True,
                           num_workers=self.num_workers, pin_memory=True,persistent_workers=True)
 
@@ -474,8 +505,7 @@ class SegmentationDataModule(pl.LightningDataModule):
         else:
             raise ValueError("split must be either 'train' or 'val'")
 
-        batch = next(iter(loader))
-        inputs, gts = batch[:2]  # Assuming dataset returns (input, gt, ...)
+        inputs, gts = next(iter(loader))
 
         plot(inputs[:num_samples], gts[:num_samples])
 
@@ -496,15 +526,23 @@ def plot(inputs, gts, preds=None):
             plt.subplot(1, cols, 3); plt.imshow(pred_mask, cmap='gray'); plt.title('Pred'); plt.axis('off')
         plt.tight_layout(); plt.show()
 
-def show_samples(data):
+def show_samples(data, num_samples=10):
     data.setup()
-    data.show_samples('train',10)
+    data.show_samples('train',num_samples)
 
 def train(data,max_epochs=100):
     arch_name='Segformer'
-    encoder_name="efficientnet-b7"
+    
+    # encoder_name,encoder_weights="efficientnet-b7","imagenet"
+    # encoder_name,encoder_weights="mit_b5","imagenet"
+    encoder_name,encoder_weights="resnext101_32x8d","instagram"
+    # encoder_name,encoder_weights="timm-efficientnet-b8","imagenet"
 
-    model = SegmentationModel(arch_name=arch_name,encoder_name=encoder_name, lr=1e-4)
+    # encoder_name,encoder_weights="timm-efficientnet-l2","noisy-student"
+
+    lr=1e-4
+
+    model = SegmentationModel(arch_name,encoder_name,encoder_weights,1,lr)
     trainer = Trainer(
         max_epochs=max_epochs,
         accelerator="auto",
@@ -536,7 +574,8 @@ if __name__ == "__main__":
         input_prename='viewport_2',
         mask_prename='viewport_1',
         batch_size=batch_size,
+        data_step=20,
     )
+    # show_samples(data,30)
     train(data,100)
-    # show_samples(data)
-    # infer('./Segformer-efficientnet-b7-logs/lightning_logs/version_6/checkpoints/epoch=6-step=1386.ckpt')
+    # infer('Segformer-efficientnet-b7-logs/lightning_logs/version_10/checkpoints/epoch=59-step=11880.ckpt')
