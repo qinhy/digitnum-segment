@@ -59,48 +59,42 @@ class AugDataset(Dataset):
         self.mixup = mixup
         self.cutmix = cutmix
         self.aug = A.Compose([
-            # A.Affine(
-            #     rotate=(-25, 25),             # Arbitrary rotation range
-            #     translate_percent={"x": (-0.5, 0.5), "y": (-0.5, 0.5)},  # Up to ±20% shift
-            #     scale=(0.8, 1.2),             # Slight zoom in/out
-            #     p=0.7
-            # ),
-            # A.HorizontalFlip(p=0.5),
-            # A.VerticalFlip(p=0.5),
-            # A.RandomRotate90(p=0.5),
-            # A.GridDistortion(num_steps=5, distort_limit=(0.3, 0.3), p=0.7),
-            # A.CoarseDropout(
-            #     num_holes_range=(1, 10),
-            #     hole_height_range=(IMAGE_SIZE//10, IMAGE_SIZE//3),
-            #     hole_width_range=(IMAGE_SIZE//10, IMAGE_SIZE//3),
-            #     fill=0,
-            #     p=0.5
-            # ),
+            A.Affine(
+                rotate=(-25, 25),             # Arbitrary rotation range
+                translate_percent={"x": (-0.5, 0.5), "y": (-0.5, 0.5)},  # Up to ±20% shift
+                scale=(0.8, 1.2),             # Slight zoom in/out
+                p=0.7
+            ),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.RandomRotate90(p=0.5),
 
-            # A.CoarseDropout(
-            #     num_holes_range=(100, 200),
-            #     hole_height_range=(IMAGE_SIZE//100, IMAGE_SIZE//50),
-            #     hole_width_range=(IMAGE_SIZE//100, IMAGE_SIZE//50),
-            #     fill=0,
-            #     p=0.9
-            # ),
+            A.OneOf([
+                A.ElasticTransform(
+                    alpha=1.0,            # Controls the strength of deformation
+                    sigma=30,             # Controls the smoothness (lower = more local bends)
+                    interpolation=cv2.INTER_LINEAR,
+                    mask_interpolation=cv2.INTER_NEAREST,
+                    noise_distribution="gaussian",  # More natural warps
+                    p=0.7                 # Apply with 70% probability
+                ),
+                A.GridDistortion(num_steps=5, distort_limit=0.05, p=0.7),
+                A.OpticalDistortion(p=0.7),
+            ], p=1.0),
 
-            # A.GaussianBlur(p=0.5),
-            # A.RandomBrightnessContrast(
-            #     brightness_limit=(-0.05, 0.05),
-            #     contrast_limit=(-0.05, 0.05),
-            #     brightness_by_max=True,
-            #     ensure_safe_range=True,
-            #     p=0.5),
-            # A.GaussNoise(std_range=(0.01, 0.05), p=0.5),
+            A.CoarseDropout(
+                num_holes_range=(100, 200),
+                hole_height_range=(IMAGE_SIZE//100, IMAGE_SIZE//50),
+                hole_width_range=(IMAGE_SIZE//100, IMAGE_SIZE//50),
+                fill=0,
+                p=0.9
+            ),
 
-            # A.Normalize(mean=0.0, std=1.0),
-            # AugDataset.ToUint8(),
+            A.GaussianBlur(p=0.5),
+            A.GaussNoise(std_range=(0.01, 0.05), p=0.5),
         ])
 
         self.no_aug = A.Compose([
-            # A.Normalize(mean=0.0, std=1.0),
-            # AugDataset.ToUint8(),
         ])
 
     def _build_sample(self, idx):
@@ -119,13 +113,14 @@ class AugDataset(Dataset):
             M = min(H,W)
 
             # # Apply Mixup
-            # if self.mixup and random.random() < 0.5:
+            # if self.mixup and random.random() < 0.2:
             #     idx2 = random.randint(0, len(self) - 1)
             #     input2, mask2 = augment(*self._build_sample(idx2))
 
-            #     lam = np.random.beta(0.4, 0.4)
+            #     lam = 0.5#np.random.beta(0.4, 0.4)
             #     input_tensor = lam * input_tensor + (1 - lam) * input2
-            #     mask_tensor = lam * mask_tensor + (1 - lam) * mask2
+            #     mask_tensor *= 0.0
+            #     # mask_tensor = lam * mask_tensor + (1 - lam) * mask2
 
             # # Apply CutMix
             # if self.cutmix and random.random() < 0.5:
@@ -327,7 +322,10 @@ class SideBySideSegmentationDataset(AugDataset):
         mask_img  = np.asarray(mask_img).copy().astype(np.uint8)
 
         # Normalize mask to binary
-        # mask_img  = ((mask_img > 0)*255.0).astype(np.uint8)
+        mask_img  = ((mask_img > 0)*255.0).astype(np.uint8)
+        # Remove small noise using morphological opening
+        kernel = np.ones((3,3), np.uint8)
+        mask_img = cv2.morphologyEx(mask_img, cv2.MORPH_OPEN, kernel)        
         return input_img,mask_img
 
     @staticmethod
@@ -457,9 +455,8 @@ class SegmentationModel(pl.LightningModule):
         images, masks = batch
         logits = self(images)
         loss = self.loss_fn(logits, masks)
-
-        preds = torch.sigmoid(logits)
-        preds_bin = (preds > 0.5).float()
+        
+        preds_bin = (torch.sigmoid(logits) > 0.5).float()
         iou = self._iou_score(preds_bin, masks)
 
         self.log(f"{stage}_loss", loss, on_epoch=True, prog_bar=True)
@@ -622,15 +619,15 @@ if __name__ == "__main__":
         batch_size=batch_size,
         data_step=1,
     )
-    # show_samples(get_data(32),30)
+    show_samples(get_data(32),30)
     encoder_name,encoder_weights="timm-efficientnet-b8","imagenet"
-    train(get_data(32),encoder_name,encoder_weights,1)
-    exit()
+    train(get_data(16),encoder_name,encoder_weights,100)
     # encoder_name,encoder_weights="timm-efficientnet-b8","imagenet"
-    # train(get_data(32),encoder_name,encoder_weights,500)
+    # train(get_data(16),encoder_name,encoder_weights,500)
 
-    encoder_name,encoder_weights="timm-efficientnet-l2","noisy-student"
-    train(get_data(16),encoder_name,encoder_weights,1)
+    # encoder_name,encoder_weights="timm-efficientnet-l2","noisy-student"
+    # train(get_data(16),encoder_name,encoder_weights,100)
     # encoder_name,encoder_weights="timm-efficientnet-l2","noisy-student"
     # train(get_data(16),encoder_name,encoder_weights,500)
-    # infer('Segformer-timm-efficientnet-b8-logs/lightning_logs/version_1/checkpoints/epoch=0-step=31.ckpt')
+    # infer('Segformer-timm-efficientnet-b8-logs/lightning_logs/version_2/checkpoints/epoch=91-step=36340.ckpt')
+    
