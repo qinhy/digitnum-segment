@@ -3,3 +3,4 @@
 *.pth
 /logs
 /Segformer-efficientnet-b7-logs
+/Segformer-timm-efficientnet-b8-logs
