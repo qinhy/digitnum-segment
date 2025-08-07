@@ -81,20 +81,20 @@ class AugDataset(Dataset):
                 A.GridDistortion(num_steps=5, distort_limit=0.05, p=0.7),
                 A.OpticalDistortion(p=0.7),
             ], p=1.0),
+            
+            A.OneOf([
+                A.GaussianBlur(p=0.5),
+                A.GaussNoise(std_range=(0.01, 0.05), p=0.5),
+            ], p=1.0),
 
-            A.CoarseDropout(
-                num_holes_range=(100, 200),
-                hole_height_range=(IMAGE_SIZE//100, IMAGE_SIZE//50),
-                hole_width_range=(IMAGE_SIZE//100, IMAGE_SIZE//50),
-                fill=0,
-                p=0.9
-            ),
+            A.PixelDropout(dropout_prob=0.025, per_channel=False, drop_value=0, p=0.7),
+            A.PixelDropout(dropout_prob=0.025, per_channel=False, drop_value=255, p=0.7),
 
-            A.GaussianBlur(p=0.5),
-            A.GaussNoise(std_range=(0.01, 0.05), p=0.5),
         ])
 
         self.no_aug = A.Compose([
+            A.PixelDropout(dropout_prob=0.025, per_channel=False, drop_value=0, p=1.0),
+            A.PixelDropout(dropout_prob=0.025, per_channel=False, drop_value=255, p=1.0),
         ])
 
     def _build_sample(self, idx):
@@ -505,7 +505,7 @@ class SegmentationModel(pl.LightningModule):
         return iou.mean()
 
 class SegmentationDataModule(pl.LightningDataModule):
-    def __init__(self, train_dir, val_dir, input_prename, mask_prename,
+    def __init__(self, train_dir, val_dir, input_prename=None, mask_prename=None,
                  batch_size=32, num_workers=4,
                  data_step=1):
         super().__init__()
@@ -528,6 +528,7 @@ class SegmentationDataModule(pl.LightningDataModule):
             train=False,
             data_step = self.data_step,
         )
+        return self
         # self.train_dataset = TwoImagesSegmentationDataset(
         #     image_dir=self.train_dir,
         #     input_prename=self.input_prename,
@@ -547,7 +548,7 @@ class SegmentationDataModule(pl.LightningDataModule):
                           num_workers=self.num_workers, pin_memory=True,persistent_workers=True)
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False,
+        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=True,
                           num_workers=self.num_workers, pin_memory=True,persistent_workers=True)
     
     def show_samples(self, split='val', num_samples=5):
@@ -579,49 +580,51 @@ def plot(inputs, gts, preds=None):
             plt.subplot(1, cols, 3); plt.imshow(pred_mask, cmap='gray'); plt.title('Pred'); plt.axis('off')
         plt.tight_layout(); plt.show()
 
-def show_samples(data, num_samples=10):
+def show_samples(data:SegmentationDataModule, num_samples=10, what='train'):
     data.setup()
-    data.show_samples('train',num_samples)
+    data.show_samples(what,num_samples)
 
-def train(data,encoder_name,encoder_weights,max_epochs=100):
+def train(data,encoder_name,encoder_weights,
+          max_epochs=100,in_channels=1,lr=1e-4):
     arch_name='Segformer'
-    lr=1e-4
 
-    model = SegmentationModel(arch_name,encoder_name,encoder_weights,1,lr)
-    trainer = Trainer(
+    model = SegmentationModel(arch_name,encoder_name,encoder_weights,in_channels,lr)
+    get_trainer = lambda max_epochs:Trainer(
         max_epochs=max_epochs,
         accelerator="auto",
-        devices=1,
         logger=CSVLogger(save_dir=f"{arch_name}-{encoder_name}-logs/"),
         callbacks=[ModelCheckpoint(monitor="val_iou", mode="max")]
     )
+    
+    if isinstance(data,list):
+        t = get_trainer(max_epochs)
+        for d in data:
+            t.fit(model, datamodule=d)
+            t.fit_loop.max_epochs+=max_epochs
+    else:
+        get_trainer(max_epochs).fit(model, datamodule=data)
 
-    trainer.fit(model, datamodule=data)
-
-def infer(ckpt): 
+def infer(ckpt,data=None): 
     batch_size=32
-    real_loader = SideBySideSegmentationDataset.get_dataloader('./tmp/real',batch_size=batch_size)
+    if data is None:
+        data = real_loader = SideBySideSegmentationDataset.get_dataloader('./tmp/real',batch_size=batch_size)
+
     model = SegmentationModel.load_from_checkpoint(ckpt,map_location=torch.device('cpu'))
     model.eval()
     with torch.no_grad():
-        test_inputs, test_masks = next(iter(real_loader))
+        test_inputs, test_masks = next(iter(data))
         test_inputs = test_inputs.to(model.device)
         pred_logits = model(test_inputs)
         pred_masks = (torch.sigmoid(pred_logits) > 0.5).float()
         plot(test_inputs, test_masks, pred_masks)
 
 if __name__ == "__main__":
-    get_data = lambda batch_size:SegmentationDataModule(
-        train_dir='./tmp/sim2',
-        val_dir='./tmp/sim2',
-        input_prename='viewport_2',
-        mask_prename='viewport_1',
-        batch_size=batch_size,
-        data_step=1,
-    )
-    show_samples(get_data(32),30)
+    get_data = lambda batch_size,dir='./tmp/sim2':SegmentationDataModule(
+        train_dir=dir,val_dir=dir,batch_size=batch_size,)
+    show_samples(get_data(32),30,'train')
+    show_samples(get_data(32),30,'val')
     encoder_name,encoder_weights="timm-efficientnet-b8","imagenet"
-    train(get_data(16),encoder_name,encoder_weights,100)
+    train(get_data(20,'./tmp/sim2'),encoder_name,encoder_weights,10)
     # encoder_name,encoder_weights="timm-efficientnet-b8","imagenet"
     # train(get_data(16),encoder_name,encoder_weights,500)
 
@@ -629,5 +632,6 @@ if __name__ == "__main__":
     # train(get_data(16),encoder_name,encoder_weights,100)
     # encoder_name,encoder_weights="timm-efficientnet-l2","noisy-student"
     # train(get_data(16),encoder_name,encoder_weights,500)
-    # infer('Segformer-timm-efficientnet-b8-logs/lightning_logs/version_2/checkpoints/epoch=91-step=36340.ckpt')
+    # infer('Segformer-timm-efficientnet-b8-logs/lightning_logs/version_best_C=1/checkpoints/epoch=183-step=58144.ckpt')
+
     
