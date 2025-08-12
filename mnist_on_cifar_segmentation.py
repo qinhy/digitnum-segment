@@ -418,7 +418,7 @@ class SegmentationModel(pl.LightningModule):
             # Combined loss
             return self.tversky_weight * tversky_loss + (1 - self.tversky_weight) * dice_loss
 
-    def __init__(self, arch_name='Segformer', encoder_name='efficientnet-b7',
+    def __init__(self, arch_name='DeepLabV3Plus', encoder_name='efficientnet-b7',
                        encoder_weights='imagenet', in_channels=1, lr=1e-4):
         super().__init__()
         # self.loss_fn = nn.BCEWithLogitsLoss()
@@ -586,7 +586,7 @@ def show_samples(data:SegmentationDataModule, num_samples=10, what='train'):
 
 def train(data,encoder_name,encoder_weights,
           max_epochs=100,in_channels=1,lr=1e-4):
-    arch_name='Segformer'
+    arch_name='DeepLabV3Plus'
 
     model = SegmentationModel(arch_name,encoder_name,encoder_weights,in_channels,lr)
     get_trainer = lambda max_epochs:Trainer(
@@ -619,12 +619,14 @@ def infer(ckpt,data=None):
         plot(test_inputs, test_masks, pred_masks)
 
 if __name__ == "__main__":
+    # NO_ALBUMENTATIONS_UPDATE=1
+    # CUDA_VISIBLE_DEVICES=0
     get_data = lambda batch_size,dir='./tmp/sim2':SegmentationDataModule(
         train_dir=dir,val_dir=dir,batch_size=batch_size,)
-    show_samples(get_data(32),30,'train')
-    show_samples(get_data(32),30,'val')
+    # show_samples(get_data(32),30,'train')
+    # show_samples(get_data(32),30,'val')
     encoder_name,encoder_weights="timm-efficientnet-b8","imagenet"
-    train(get_data(20,'./tmp/sim2'),encoder_name,encoder_weights,10)
+    train(get_data(4,'./tmp/sim2'),encoder_name,encoder_weights,10)
     # encoder_name,encoder_weights="timm-efficientnet-b8","imagenet"
     # train(get_data(16),encoder_name,encoder_weights,500)
 
