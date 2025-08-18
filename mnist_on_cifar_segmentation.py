@@ -1,6 +1,5 @@
 # Standard libraries
 import os
-from pathlib import Path
 import time
 import random
 import ssl
@@ -62,39 +61,136 @@ class AugDataset(Dataset):
         self.train=train
         self.mixup = mixup
         self.cutmix = cutmix
-        self.aug = A.Compose([
+        self.aug_lite = A.Compose([
             A.Affine(
-                rotate=(-25, 25),             # Arbitrary rotation range
-                translate_percent={"x": (-0.5, 0.5), "y": (-0.5, 0.5)},  # Up to ±20% shift
-                scale=(0.8, 1.2),             # Slight zoom in/out
-                p=0.7
+                rotate=(-20, 20),
+                translate_percent={"x": (-0.15, 0.15), "y": (-0.15, 0.15)},
+                scale=(0.9, 1.1),
+                shear=(-8, 8),
+                interpolation=cv2.INTER_LINEAR,
+                mask_interpolation=cv2.INTER_NEAREST,
+                p=0.8
             ),
+
             A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.5),
-            A.RandomRotate90(p=0.5),
 
             A.OneOf([
-                A.ElasticTransform(
-                    alpha=1.0,            # Controls the strength of deformation
-                    sigma=30,             # Controls the smoothness (lower = more local bends)
-                    interpolation=cv2.INTER_LINEAR,
-                    mask_interpolation=cv2.INTER_NEAREST,
-                    noise_distribution="gaussian",  # More natural warps
-                    p=0.7                 # Apply with 70% probability
-                ),
-                A.GridDistortion(num_steps=5, distort_limit=0.05, p=0.7),
-                A.OpticalDistortion(p=0.7),
-            ], p=1.0),
-            
+                A.GaussianBlur(blur_limit=(3, 5), p=1.0),
+                A.MotionBlur(blur_limit=5, p=1.0),
+                A.GaussNoise(var_limit=(5.0, 25.0), p=1.0),
+            ], p=0.6),
+
+            A.RandomBrightnessContrast(brightness_limit=(-0.5, 0.5),
+                                       contrast_limit=(-0.5, 0.5), p=0.6),
+
+            A.HueSaturationValue(hue_shift_limit=8, sat_shift_limit=15, val_shift_limit=10, p=0.4),
+
+            A.CoarseDropout(max_holes=4, max_height=0.08, max_width=0.08,
+                            min_holes=1, min_height=0.03, min_width=0.03,
+                            fill_value=0, p=0.35),
+
+            # Rare salt-or-pepper
             A.OneOf([
-                A.GaussianBlur(p=0.5),
-                A.GaussNoise(std_range=(0.01, 0.05), p=0.5),
-            ], p=1.0),
-
-            A.PixelDropout(dropout_prob=0.025, per_channel=False, drop_value=0, p=0.7),
-            A.PixelDropout(dropout_prob=0.025, per_channel=False, drop_value=255, p=0.7),
-
+                A.PixelDropout(dropout_prob=0.02, drop_value=0, p=1.0),
+                A.PixelDropout(dropout_prob=0.02, drop_value=255, p=1.0),
+            ], p=0.15),
         ])
+
+        self.aug_strong = A.Compose([
+            A.Affine(
+                rotate=(-25, 25),
+                translate_percent={"x": (-0.2, 0.2), "y": (-0.2, 0.2)},
+                scale=(0.85, 1.15),
+                shear=(-10, 10),
+                interpolation=cv2.INTER_LINEAR,
+                mask_interpolation=cv2.INTER_NEAREST,
+                p=0.9
+            ),
+
+            A.HorizontalFlip(p=0.5),
+
+            A.OneOf([
+                A.ElasticTransform(alpha=1.2, sigma=30, interpolation=cv2.INTER_LINEAR, p=1.0),
+                A.GridDistortion(num_steps=5, distort_limit=0.07, p=1.0),
+                A.OpticalDistortion(distort_limit=0.12, shift_limit=0.05, p=1.0),
+            ], p=0.6),
+
+            A.OneOf([
+                A.GaussianBlur(blur_limit=(3, 7), p=1.0),
+                A.MotionBlur(blur_limit=7, p=1.0),
+                A.MedianBlur(blur_limit=5, p=1.0),
+                A.GaussNoise(var_limit=(10.0, 40.0), p=1.0),
+            ], p=0.7),
+
+            A.OneOf([
+                A.RandomBrightnessContrast(brightness_limit=0.25, contrast_limit=0.25, p=1.0),
+                A.CLAHE(clip_limit=(2, 4), p=1.0),
+                A.RandomGamma(gamma_limit=(80, 120), p=1.0),
+            ], p=0.6),
+
+            A.HueSaturationValue(hue_shift_limit=12, sat_shift_limit=20, val_shift_limit=15, p=0.5),
+
+            A.CoarseDropout(max_holes=6, max_height=0.1, max_width=0.1,
+                            min_holes=1, min_height=0.04, min_width=0.04,
+                            fill_value=0, p=0.5),
+
+            A.ChannelShuffle(p=0.05),
+            A.ToGray(p=0.05),
+        ])
+
+        self.aug_very_strong = A.Compose([
+            A.Affine(
+                rotate=(-30, 30),
+                translate_percent={"x": (-0.25, 0.25), "y": (-0.25, 0.25)},
+                scale=(0.8, 1.2),
+                shear=(-12, 12),
+                interpolation=cv2.INTER_LINEAR,
+                mask_interpolation=cv2.INTER_NEAREST,
+                p=0.9
+            ),
+
+            A.OneOf([
+                A.RandomRotate90(p=1.0),
+                A.HorizontalFlip(p=1.0),
+                A.VerticalFlip(p=1.0),
+            ], p=0.75),
+
+            
+            A.ElasticTransform(alpha=1.4, sigma=32, interpolation=cv2.INTER_LINEAR, 
+               p=0.7),
+            A.GridDistortion(num_steps=7, distort_limit=0.1, 
+               p=0.7),
+            A.OpticalDistortion(distort_limit=0.15, shift_limit=0.07, 
+               p=0.7),
+            A.Perspective(scale=(0.04, 0.08), 
+               p=0.7),
+
+            A.OneOf([
+                A.GaussianBlur(blur_limit=(3, 9), p=1.0),
+                A.MotionBlur(blur_limit=11, p=1.0),
+                A.Defocus(radius=(2, 5), alias_blur=(0.1, 0.3), p=1.0),
+                A.GaussNoise(var_limit=(15.0, 60.0), p=1.0),
+            ], p=0.75),
+
+            A.OneOf([
+                A.RandomBrightnessContrast(brightness_limit=(-0.5, 0.5),
+                                        contrast_limit=(-0.5, 0.5), p=1.0),
+                A.CLAHE(clip_limit=(2, 4), p=1.0),
+                A.RandomGamma(gamma_limit=(70, 130), p=1.0),
+            ], p=0.7),
+
+            A.CoarseDropout(max_holes=10, max_height=0.15, max_width=0.15,
+                            min_holes=2, min_height=0.05, min_width=0.05,
+                            fill_value=0, 
+               p=0.7),
+
+            A.OneOf([
+                A.PixelDropout(dropout_prob=0.03, drop_value=0, p=1.0),
+                A.PixelDropout(dropout_prob=0.03, drop_value=255, p=1.0),
+            ], p=0.75),
+        ])
+
+        self.aug = self.aug_very_strong
 
         self.no_aug = A.Compose([
             A.PixelDropout(dropout_prob=0.025, per_channel=False, drop_value=0, p=1.0),
@@ -509,7 +605,7 @@ class SegmentationModel(pl.LightningModule):
             dims = tuple(range(1, probs.dim()))
             intersection = (probs * targets).sum(dim=dims)
             union = probs.sum(dim=dims) + targets.sum(dim=dims)
-            dice = (2. * intersection + self.smooth) / (union + self.smooth) if hasattr(self, "smooth") else (2.*intersection + smooth)/(union+smooth)
+            dice = (2. * intersection + smooth) / (union + smooth)
             return 1 - dice.mean()
 
         def forward(self, logits, targets):
