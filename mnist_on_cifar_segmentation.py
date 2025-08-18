@@ -253,7 +253,7 @@ class AugDataset(Dataset):
 
         return input_tensor, mask_tensor
     
-class MNISTOnCIFARSegmentation(AugDataset):
+class MNISTOnCIFARSegmentationDataset(AugDataset):
     def __init__(self, train=True, mixup=True, cutmix=True):
         super().__init__(train, mixup, cutmix)
         self.mnist = datasets.MNIST(root='./data', train=train, download=True)
@@ -286,8 +286,8 @@ class MNISTOnCIFARSegmentation(AugDataset):
     # --- Dataloaders ---
     @staticmethod
     def get_dataloaders(batch_size=32):
-        train_dataset = MNISTOnCIFARSegmentation(train=True)
-        val_dataset = MNISTOnCIFARSegmentation(train=False)
+        train_dataset = MNISTOnCIFARSegmentationDataset(train=True)
+        val_dataset = MNISTOnCIFARSegmentationDataset(train=False)
 
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
@@ -446,39 +446,73 @@ class SideBySideSegmentationDataset(AugDataset):
     
 class SegmentationModel(pl.LightningModule):
 
-    def _embed_dim_from_variant(variant: str):
-        v = variant.lower()
-        if "vitb16" in v: return 768
-        if "vitl16" in v: return 1024
-        if "vith16" in v: return 1280
-        raise ValueError(f"Unknown DINOv3 variant: {variant} (expected vitb16|vitl16|vith16)")
-
     class DINOv3Seg(nn.Module):
-        """
-        DINOv3 ViT/16 backbone loaded from a LOCAL torch.hub repo.
-        - Uses: torch.hub.load(REPO_DIR, 'dinov3_vitb16', source='local', weights='...pth')
-        - Auto-pads inputs to multiples of 16, then unpads.
-        - 1-ch input supported via 1x1 conv adapter.
-        - Binary head by default (change out_channels for multi-class).
-        - INTERNAL freeze/unfreeze controls.
-        """
+
         def __init__(self, variant="vitb16", hub_repo_dir:str=None, hub_weights:str=None,
                     in_channels:int=1, out_channels:int=1,
-                    freeze_backbone: bool = True):
+                    freeze_backbone: bool = True,
+                    adapter_mode = "repeat"):
             super().__init__()
             assert hub_repo_dir and hub_weights, "Provide hub_repo_dir and hub_weights."
             builder = f"dinov3_{variant}"  # e.g., dinov3_vitb16
             # --- your exact local hub load ---
             self.backbone = torch.hub.load(hub_repo_dir, builder, source='local', weights=hub_weights)
 
-            self.embed_dim = 768 if "vitb16" in variant.lower() else (1024 if "vitl16" in variant.lower() else 1280)
-            self.input_adapter = nn.Identity() if in_channels == 3 else nn.Conv2d(in_channels, 3, 1)
+            if in_channels == 3:
+                self.input_adapter = nn.Identity()
+            else:
+                if adapter_mode == "repeat":
+                    class RepeatGray3(nn.Module):
+                        def forward(self, x):        # x: [B,1,H,W] float in [0,1] or [0,255]
+                            if x.shape[1] == 1:
+                                return x.repeat(1, 3, 1, 1)
+                            return x
+                    self.input_adapter = RepeatGray3()
+                elif adapter_mode == "fixed":
+                    def fixed_gray_to_rgb_conv():
+                        conv = nn.Conv2d(1, 3, kernel_size=1, bias=True)
+                        with torch.no_grad():
+                            conv.weight.fill_(1.0)   # each RGB = gray * 1
+                            conv.bias.zero_()
+                        for p in conv.parameters():
+                            p.requires_grad = False
+                        return conv
+                    self.input_adapter = fixed_gray_to_rgb_conv()
+                elif adapter_mode == "conv":  # trainable
+                    self.input_adapter = nn.Conv2d(in_channels, 3, 1)
+                else:
+                    raise ValueError(f"Unknown adapter_mode: {adapter_mode}")
 
-            self.proj = nn.Conv2d(self.embed_dim, 256, 1)
+            self.embed_dim = 768 if "vitb16" in variant.lower() else (1024 if "vitl16" in variant.lower() else 1280)
+            hidden= 256 # 256 384 512
+            self.proj = nn.Conv2d(self.embed_dim, hidden, 1)
+            
+            # --- depthwise-separable conv block in nn.Sequential ---
+            def sepconv_block(ch: int) -> nn.Sequential:
+                return nn.Sequential(
+                    nn.Conv2d(ch, ch, kernel_size=3, padding=1, groups=ch, bias=False),  # depthwise
+                    nn.Conv2d(ch, ch, kernel_size=1, bias=False),                        # pointwise
+                    nn.BatchNorm2d(ch),
+                    nn.ReLU(inplace=True),
+                )
+            
             self.dec = nn.Sequential(
-                nn.Conv2d(256, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(inplace=True),
-                nn.Conv2d(256, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(inplace=True),
-                nn.Conv2d(256, out_channels, 1),
+                nn.Conv2d(hidden, hidden, 3, padding=1), nn.BatchNorm2d(hidden), nn.ReLU(inplace=True),
+                nn.Conv2d(hidden, hidden, 3, padding=1), nn.BatchNorm2d(hidden), nn.ReLU(inplace=True),
+                
+                sepconv_block(hidden),
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                
+                sepconv_block(hidden),
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                
+                sepconv_block(hidden),
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                
+                sepconv_block(hidden),
+                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+
+                nn.Conv2d(hidden, out_channels, 1),
             )
 
             # freeze control
@@ -568,9 +602,12 @@ class SegmentationModel(pl.LightningModule):
             H, W = x.shape[-2:]
             toks = self._forward_tokens(x)                   # [B, N(+1), C]
             grid = self._tokens_to_grid(toks, H, W, 16)      # [B, C, H/16, W/16]
-            logits_lo = self.dec(self.proj(grid))            # [B, out_ch, H/16, W/16]
-            logits = F.interpolate(logits_lo, size=(H, W), mode="bilinear", align_corners=False)
+            logits = self.dec(self.proj(grid))            # [B, out_ch, H/16, W/16]
+            oB,oC,oH,oW = logits.shape
+            if oH!=H and W!=oW:
+                logits = F.interpolate(logits, size=(H, W), mode="bilinear", align_corners=False)
             return self._unpad(logits, pad_hw)
+        
     class BCEDiceLoss(nn.Module):
         def __init__(self, bce_weight=0.5, dice_weight=0.5):
             super().__init__()
@@ -701,6 +738,7 @@ class SegmentationModel(pl.LightningModule):
         iou = self._iou_score(preds_bin, masks)
         self.log(f"{stage}_loss", loss, on_epoch=True, prog_bar=True)
         self.log(f"{stage}_iou", iou, on_epoch=True, prog_bar=True)
+        print()
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -850,8 +888,9 @@ if __name__ == "__main__":
     # show_samples(get_data(32),30,'val')
     
     arch_name,encoder_name,encoder_weights='DeepLabV3Plus',"timm-efficientnet-b8","imagenet"
-    arch_name,encoder_name,encoder_weights='D:/github/dinov3',"vitb16","./tmp/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
-    # train(get_data(4,'./tmp/sim2'),encoder_name,encoder_weights,10,arch_name=arch_name)
+    arch_name,encoder_name,encoder_weights='D:/ixs/qinhy/dinov3',"vitb16","./tmp/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
+    train(get_data(128,'./tmp/sim2'),encoder_name,encoder_weights,arch_name=arch_name,
+          max_epochs=1000,lr=0.001)
     # encoder_name,encoder_weights="timm-efficientnet-b8","imagenet"
     # train(get_data(16),encoder_name,encoder_weights,500)
 
@@ -860,6 +899,6 @@ if __name__ == "__main__":
     # encoder_name,encoder_weights="timm-efficientnet-l2","noisy-student"
     # train(get_data(16),encoder_name,encoder_weights,500)
     # infer('Segformer-timm-efficientnet-b8-logs/lightning_logs/version_best_C=1/checkpoints/epoch=183-step=58144.ckpt')
-    infer('dinov3-vitb16-logs/lightning_logs/version_0/checkpoints/epoch=0-step=1577.ckpt')
+    # infer('dinov3-vitb16-logs/lightning_logs/version_7/checkpoints/epoch=5-step=300.ckpt')
 
     
