@@ -1,5 +1,6 @@
 # Standard libraries
 import os
+from pathlib import Path
 import time
 import random
 import ssl
@@ -34,6 +35,9 @@ from pytorch_lightning.loggers import CSVLogger
 # Segmentation Models
 import segmentation_models_pytorch as smp
 
+import math, torch, torch.nn as nn, torch.nn.functional as F
+from torchmetrics import JaccardIndex
+from huggingface_hub import hf_hub_download
 
 torch.set_float32_matmul_precision('medium')
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -346,6 +350,131 @@ class SideBySideSegmentationDataset(AugDataset):
     
 class SegmentationModel(pl.LightningModule):
 
+    def _embed_dim_from_variant(variant: str):
+        v = variant.lower()
+        if "vitb16" in v: return 768
+        if "vitl16" in v: return 1024
+        if "vith16" in v: return 1280
+        raise ValueError(f"Unknown DINOv3 variant: {variant} (expected vitb16|vitl16|vith16)")
+
+    class DINOv3Seg(nn.Module):
+        """
+        DINOv3 ViT/16 backbone loaded from a LOCAL torch.hub repo.
+        - Uses: torch.hub.load(REPO_DIR, 'dinov3_vitb16', source='local', weights='...pth')
+        - Auto-pads inputs to multiples of 16, then unpads.
+        - 1-ch input supported via 1x1 conv adapter.
+        - Binary head by default (change out_channels for multi-class).
+        - INTERNAL freeze/unfreeze controls.
+        """
+        def __init__(self, variant="vitb16", hub_repo_dir:str=None, hub_weights:str=None,
+                    in_channels:int=1, out_channels:int=1,
+                    freeze_backbone: bool = True):
+            super().__init__()
+            assert hub_repo_dir and hub_weights, "Provide hub_repo_dir and hub_weights."
+            builder = f"dinov3_{variant}"  # e.g., dinov3_vitb16
+            # --- your exact local hub load ---
+            self.backbone = torch.hub.load(hub_repo_dir, builder, source='local', weights=hub_weights)
+
+            self.embed_dim = 768 if "vitb16" in variant.lower() else (1024 if "vitl16" in variant.lower() else 1280)
+            self.input_adapter = nn.Identity() if in_channels == 3 else nn.Conv2d(in_channels, 3, 1)
+
+            self.proj = nn.Conv2d(self.embed_dim, 256, 1)
+            self.dec = nn.Sequential(
+                nn.Conv2d(256, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(inplace=True),
+                nn.Conv2d(256, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(inplace=True),
+                nn.Conv2d(256, out_channels, 1),
+            )
+
+            # freeze control
+            self.is_backbone_frozen = False
+            self._auto_unfreeze_epoch = None
+            if freeze_backbone:
+                self.freeze_backbone()
+
+        # ---------- freeze/unfreeze API (internal to the class) ----------
+        def freeze_backbone(self):
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+            self.is_backbone_frozen = True
+            # keep decoder/head trainable
+            self.backbone.eval()
+            return self
+
+        def unfreeze_backbone(self):
+            for p in self.backbone.parameters():
+                p.requires_grad = True
+            self.is_backbone_frozen = False
+            if self.training:
+                self.backbone.train()
+            return self
+
+        def schedule_unfreeze(self, epoch:int):
+            """Set an epoch at which you'll call maybe_auto_unfreeze(current_epoch)."""
+            self._auto_unfreeze_epoch = int(epoch)
+
+        def maybe_auto_unfreeze(self, current_epoch:int):
+            if self._auto_unfreeze_epoch is not None and current_epoch >= self._auto_unfreeze_epoch:
+                if self.is_backbone_frozen:
+                    self.unfreeze_backbone()
+
+        # keep backbone in eval() whenever it's frozen (even if module is set to train)
+        def train(self, mode: bool = True):
+            super().train(mode)
+            if self.is_backbone_frozen:
+                self.backbone.eval()
+            return self
+
+        # handy param groups for 2-LR optimizers
+        def param_groups(self, lr_head: float, lr_backbone: float, weight_decay: float = 0.0):
+            head = list(self.input_adapter.parameters()) + list(self.proj.parameters()) + list(self.dec.parameters())
+            bb   = [p for p in self.backbone.parameters() if p.requires_grad]
+            groups = [{"params": head, "lr": lr_head, "weight_decay": weight_decay}]
+            if bb:
+                groups.append({"params": bb, "lr": lr_backbone, "weight_decay": weight_decay})
+            return groups
+
+        # ---------- forward utils ----------
+        @staticmethod
+        def _pad_to_multiple(x, multiple=16):
+            H, W = x.shape[-2:]
+            ph = (multiple - H % multiple) % multiple
+            pw = (multiple - W % multiple) % multiple
+            if ph or pw:
+                x = F.pad(x, (0, pw, 0, ph))
+            return x, (ph, pw)
+
+        @staticmethod
+        def _unpad(x, pad_hw):
+            ph, pw = pad_hw
+            return x[..., : x.shape[-2] - ph if ph else x.shape[-2], : x.shape[-1] - pw if pw else x.shape[-1]]
+
+        def _tokens_to_grid(self, toks, H, W, patch=16):
+            if toks.dim() == 3 and toks.size(1) == (H // patch) * (W // patch) + 1:
+                toks = toks[:, 1:, :]
+            B, N, C = toks.shape
+            h, w = H // patch, W // patch
+            return toks.transpose(1, 2).reshape(B, C, h, w)
+
+        def _forward_tokens(self, x):
+            out = self.backbone.forward_features(x) if hasattr(self.backbone, "forward_features") else self.backbone(x)
+            if isinstance(out, dict):
+                for k in ("x", "x_norm_patchtokens", "x_prenorm", "tokens"):
+                    if k in out:
+                        return out[k]
+                raise RuntimeError("Backbone dict lacks token tensor.")
+            if torch.is_tensor(out) and out.dim() == 3:
+                return out
+            raise RuntimeError("Unexpected backbone output (expected [B,N,C] tokens or dict).")
+
+        def forward(self, x):
+            x = self.input_adapter(x)
+            x, pad_hw = self._pad_to_multiple(x, 16)
+            H, W = x.shape[-2:]
+            toks = self._forward_tokens(x)                   # [B, N(+1), C]
+            grid = self._tokens_to_grid(toks, H, W, 16)      # [B, C, H/16, W/16]
+            logits_lo = self.dec(self.proj(grid))            # [B, out_ch, H/16, W/16]
+            logits = F.interpolate(logits_lo, size=(H, W), mode="bilinear", align_corners=False)
+            return self._unpad(logits, pad_hw)
     class BCEDiceLoss(nn.Module):
         def __init__(self, bce_weight=0.5, dice_weight=0.5):
             super().__init__()
@@ -380,7 +509,7 @@ class SegmentationModel(pl.LightningModule):
             dims = tuple(range(1, probs.dim()))
             intersection = (probs * targets).sum(dim=dims)
             union = probs.sum(dim=dims) + targets.sum(dim=dims)
-            dice = (2. * intersection + smooth) / (union + smooth)
+            dice = (2. * intersection + self.smooth) / (union + self.smooth) if hasattr(self, "smooth") else (2.*intersection + smooth)/(union+smooth)
             return 1 - dice.mean()
 
         def forward(self, logits, targets):
@@ -400,69 +529,82 @@ class SegmentationModel(pl.LightningModule):
         def forward(self, logits, targets):
             probs = torch.sigmoid(logits)
             dims = tuple(range(1, logits.dim()))
-
-            # Tversky components
             tp = (probs * targets).sum(dim=dims)
             fp = ((1 - targets) * probs).sum(dim=dims)
             fn = (targets * (1 - probs)).sum(dim=dims)
-
             tversky = (tp + self.smooth) / (tp + self.alpha * fp + self.beta * fn + self.smooth)
             tversky_loss = 1 - tversky.mean()
 
-            # Dice component
             intersection = (probs * targets).sum(dim=dims)
             union = probs.sum(dim=dims) + targets.sum(dim=dims)
             dice = (2. * intersection + self.smooth) / (union + self.smooth)
             dice_loss = 1 - dice.mean()
 
-            # Combined loss
             return self.tversky_weight * tversky_loss + (1 - self.tversky_weight) * dice_loss
 
     def __init__(self, arch_name='DeepLabV3Plus', encoder_name='efficientnet-b7',
-                       encoder_weights='imagenet', in_channels=1, lr=1e-4):
+                 encoder_weights='imagenet', in_channels=1, lr=1e-4):
         super().__init__()
-        # self.loss_fn = nn.BCEWithLogitsLoss()
         self.loss_fn = SegmentationModel.BCEDiceLoss()
-        self.arch_name=arch_name
-        self.encoder_name=encoder_name
-        self.encoder_weights=encoder_weights
-        self.lr=lr
-        
-        self.save_hyperparameters()
-        self.model = smp.create_model(
-            self.arch_name,
-            self.encoder_name,
-            self.encoder_weights,
-            in_channels=in_channels,
-            classes=1,
-        )
-        # preprocessing parameteres for image
-        params = smp.encoders.get_preprocessing_params(self.encoder_name)
-        std = torch.tensor(params["std"]).view(1, 3, 1, 1)
-        mean = torch.tensor(params["mean"]).view(1, 3, 1, 1)
-        if in_channels==1:
-            std = std.mean(1,keepdim=True)
-            mean = mean.mean(1,keepdim=True)
-        self.register_buffer("std", std)
-        self.register_buffer("mean", mean)
+        self.arch_name = arch_name
+        self.encoder_name = encoder_name
+        self.encoder_weights = encoder_weights
+        self.lr = lr
+        self.in_channels = in_channels
 
-    def forward(self, x:torch.Tensor):
-        # normalize image here
+        self.save_hyperparameters()
+
+
+        if "dinov3" in str(arch_name).lower():
+            # ---- DINOv3 branch (LOCAL hub) ----
+            self.model = SegmentationModel.DINOv3Seg(
+                variant=encoder_name,
+                hub_repo_dir=arch_name,
+                hub_weights=encoder_weights,
+                in_channels=in_channels,
+            )
+            # Use ImageNet normalization by default (DINO pretraining uses RGB stats)
+            mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+            std  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+            if in_channels == 1:
+                mean = mean.mean(1, keepdim=True)
+                std = std.mean(1, keepdim=True)
+            self.register_buffer("mean", mean)
+            self.register_buffer("std", std)
+
+        else:
+            # --- your original SMP path ---
+            self.model = smp.create_model(
+                self.arch_name,
+                self.encoder_name,
+                self.encoder_weights,
+                in_channels=in_channels,
+                classes=1,
+            )
+            # preprocessing parameters for SMP encoders
+            params = smp.encoders.get_preprocessing_params(self.encoder_name)
+            std = torch.tensor(params["std"]).view(1, 3, 1, 1)
+            mean = torch.tensor(params["mean"]).view(1, 3, 1, 1)
+            if in_channels == 1:
+                std = std.mean(1, keepdim=True)
+                mean = mean.mean(1, keepdim=True)
+            self.register_buffer("std", std)
+            self.register_buffer("mean", mean)
+
+    def forward(self, x: torch.Tensor):
+        # normalize image here (works for both SMP and DINOv3 branches)
         x = (x - self.mean) / self.std
         return self.model(x)
 
+    # ---- training / eval loop stays identical ----
     def _shared_step(self, batch, stage):
-        images, masks = batch
-        logits = self(images)
+        images, masks = batch                       # masks shape: [B,1,H,W] with {0,1}
+        logits = self(images)                      # logits: [B,1,H,W]
         loss = self.loss_fn(logits, masks)
-        
         preds_bin = (torch.sigmoid(logits) > 0.5).float()
         iou = self._iou_score(preds_bin, masks)
-
         self.log(f"{stage}_loss", loss, on_epoch=True, prog_bar=True)
         self.log(f"{stage}_iou", iou, on_epoch=True, prog_bar=True)
-        print()
-        
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -477,22 +619,6 @@ class SegmentationModel(pl.LightningModule):
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
         return optimizer
-        # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        #     optimizer,
-        #     mode='min',           # since we want to minimize the validation loss
-        #     factor=0.5,           # reduce LR by half
-        #     patience=3,           # wait for 3 epochs without improvement
-        # )
-
-        # return {
-        #     'optimizer': optimizer,
-        #     'lr_scheduler': {
-        #         'scheduler': scheduler,
-        #         'monitor': 'val_loss',  # this must match the logged metric name
-        #         'frequency': 1,
-        #         'interval': 'epoch'     # step the scheduler every epoch
-        #     }
-        # }
     
     def on_epoch_end(self):
         lr = self.trainer.optimizers[0].param_groups[0]['lr']
@@ -548,7 +674,7 @@ class SegmentationDataModule(pl.LightningDataModule):
                           num_workers=self.num_workers, pin_memory=True,persistent_workers=True)
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=True,
+        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False,
                           num_workers=self.num_workers, pin_memory=True,persistent_workers=True)
     
     def show_samples(self, split='val', num_samples=5):
@@ -585,10 +711,11 @@ def show_samples(data:SegmentationDataModule, num_samples=10, what='train'):
     data.show_samples(what,num_samples)
 
 def train(data,encoder_name,encoder_weights,
-          max_epochs=100,in_channels=1,lr=1e-4):
-    arch_name='DeepLabV3Plus'
+          max_epochs=100,in_channels=1,lr=1e-4, arch_name='DeepLabV3Plus'):
 
     model = SegmentationModel(arch_name,encoder_name,encoder_weights,in_channels,lr)
+    if os.path.exists(arch_name):
+        arch_name = os.path.basename(arch_name)
     get_trainer = lambda max_epochs:Trainer(
         max_epochs=max_epochs,
         accelerator="auto",
@@ -625,8 +752,10 @@ if __name__ == "__main__":
         train_dir=dir,val_dir=dir,batch_size=batch_size,)
     # show_samples(get_data(32),30,'train')
     # show_samples(get_data(32),30,'val')
-    encoder_name,encoder_weights="timm-efficientnet-b8","imagenet"
-    train(get_data(4,'./tmp/sim2'),encoder_name,encoder_weights,10)
+    
+    arch_name,encoder_name,encoder_weights='DeepLabV3Plus',"timm-efficientnet-b8","imagenet"
+    arch_name,encoder_name,encoder_weights='D:/github/dinov3',"vitb16","./tmp/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
+    # train(get_data(4,'./tmp/sim2'),encoder_name,encoder_weights,10,arch_name=arch_name)
     # encoder_name,encoder_weights="timm-efficientnet-b8","imagenet"
     # train(get_data(16),encoder_name,encoder_weights,500)
 
@@ -635,5 +764,6 @@ if __name__ == "__main__":
     # encoder_name,encoder_weights="timm-efficientnet-l2","noisy-student"
     # train(get_data(16),encoder_name,encoder_weights,500)
     # infer('Segformer-timm-efficientnet-b8-logs/lightning_logs/version_best_C=1/checkpoints/epoch=183-step=58144.ckpt')
+    infer('dinov3-vitb16-logs/lightning_logs/version_0/checkpoints/epoch=0-step=1577.ckpt')
 
     
