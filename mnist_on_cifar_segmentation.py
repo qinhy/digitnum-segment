@@ -888,9 +888,9 @@ if __name__ == "__main__":
     # show_samples(get_data(32),30,'val')
     
     arch_name,encoder_name,encoder_weights='DeepLabV3Plus',"timm-efficientnet-b8","imagenet"
-    arch_name,encoder_name,encoder_weights='D:/ixs/qinhy/dinov3',"vitb16","./tmp/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
-    train(get_data(128,'./tmp/sim2'),encoder_name,encoder_weights,arch_name=arch_name,
-          max_epochs=1000,lr=0.001)
+    arch_name,encoder_name,encoder_weights='../dinov3',"vitb16","./tmp/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth"
+    # train(get_data(128,'./tmp/sim2'),encoder_name,encoder_weights,arch_name=arch_name,
+    #       max_epochs=1000,lr=0.001)
     # encoder_name,encoder_weights="timm-efficientnet-b8","imagenet"
     # train(get_data(16),encoder_name,encoder_weights,500)
 
@@ -899,6 +899,6 @@ if __name__ == "__main__":
     # encoder_name,encoder_weights="timm-efficientnet-l2","noisy-student"
     # train(get_data(16),encoder_name,encoder_weights,500)
     # infer('Segformer-timm-efficientnet-b8-logs/lightning_logs/version_best_C=1/checkpoints/epoch=183-step=58144.ckpt')
-    # infer('dinov3-vitb16-logs/lightning_logs/version_7/checkpoints/epoch=5-step=300.ckpt')
+    infer('dinov3-vitb16-logs/lightning_logs/version_7/checkpoints/epoch=5-step=300.ckpt')
 
     
