@@ -453,7 +453,7 @@ class SegmentationModel(pl.LightningModule):
                     freeze_backbone: bool = True,
                     adapter_mode = "repeat"):
             super().__init__()
-            assert hub_repo_dir and hub_weights, "Provide hub_repo_dir and hub_weights."
+            assert hub_repo_dir and hub_weights, "Must provide hub_repo_dir and hub_weights."
             builder = f"dinov3_{variant}"  # e.g., dinov3_vitb16
             # --- your exact local hub load ---
             self.backbone = torch.hub.load(hub_repo_dir, builder, source='local', weights=hub_weights)
@@ -899,6 +899,6 @@ if __name__ == "__main__":
     # encoder_name,encoder_weights="timm-efficientnet-l2","noisy-student"
     # train(get_data(16),encoder_name,encoder_weights,500)
     # infer('Segformer-timm-efficientnet-b8-logs/lightning_logs/version_best_C=1/checkpoints/epoch=183-step=58144.ckpt')
-    infer('dinov3-vitb16-logs/lightning_logs/version_7/checkpoints/epoch=5-step=300.ckpt')
+    infer('dinov3-vitb16-logs/lightning_logs/version_5/checkpoints/epoch=3-step=200.ckpt')
 
     
