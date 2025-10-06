@@ -447,72 +447,97 @@ class SideBySideSegmentationDataset(AugDataset):
 class SegmentationModel(pl.LightningModule):
 
     class DINOv3Seg(nn.Module):
+        """
+        DINOv3-aware semantic segmentation head.
 
-        def __init__(self, variant="vitb16", hub_repo_dir:str=None, hub_weights:str=None,
-                    in_channels:int=1, out_channels:int=1,
-                    freeze_backbone: bool = True,
-                    adapter_mode = "repeat"):
+        - Robustly handles DINOv3 hub outputs (tokens or dict with normalized tokens).
+        - Produces both segmentation logits and optional L2-normalized dense descriptors.
+        - Keeps backbone frozen by default (DINOv3 features are strong frozen).
+        """
+        def __init__(
+            self,
+            variant: str = "vitb16",
+            hub_repo_dir: str = None,
+            hub_weights: str = None,
+            in_channels: int = 1,
+            out_channels: int = 1,
+            freeze_backbone: bool = True,
+            adapter_mode: str = "repeat",
+            hidden: int = 256,
+            return_dense: bool = True,     # expose DINO-style dense features
+            norm_dense: bool = True        # L2-normalize dense descriptors
+        ):
             super().__init__()
             assert hub_repo_dir and hub_weights, "Must provide hub_repo_dir and hub_weights."
-            builder = f"dinov3_{variant}"  # e.g., dinov3_vitb16
-            # --- your exact local hub load ---
-            self.backbone = torch.hub.load(hub_repo_dir, builder, source='local', weights=hub_weights)
+            builder = f"dinov3_{variant}".lower()
 
+            # --- load DINOv3 backbone from local hub ---
+            try:
+                self.backbone = torch.hub.load(hub_repo_dir, builder, source='local', weights=hub_weights)
+            except TypeError:
+                # some hubs use 'pretrained' instead of 'weights'
+                self.backbone = torch.hub.load(hub_repo_dir, builder, source='local', pretrained=True)
+
+            # --- input adapter (1ch→3ch, etc.) ---
             if in_channels == 3:
                 self.input_adapter = nn.Identity()
             else:
                 if adapter_mode == "repeat":
                     class RepeatGray3(nn.Module):
-                        def forward(self, x):        # x: [B,1,H,W] float in [0,1] or [0,255]
-                            if x.shape[1] == 1:
-                                return x.repeat(1, 3, 1, 1)
-                            return x
+                        def forward(self, x):
+                            return x.repeat(1, 3, 1, 1) if x.shape[1] == 1 else x
                     self.input_adapter = RepeatGray3()
                 elif adapter_mode == "fixed":
-                    def fixed_gray_to_rgb_conv():
-                        conv = nn.Conv2d(1, 3, kernel_size=1, bias=True)
-                        with torch.no_grad():
-                            conv.weight.fill_(1.0)   # each RGB = gray * 1
-                            conv.bias.zero_()
-                        for p in conv.parameters():
-                            p.requires_grad = False
-                        return conv
-                    self.input_adapter = fixed_gray_to_rgb_conv()
-                elif adapter_mode == "conv":  # trainable
+                    conv = nn.Conv2d(in_channels, 3, 1, bias=True)
+                    with torch.no_grad():
+                        conv.weight.zero_()
+                        for c in range(min(in_channels, 1)):
+                            conv.weight[:, c, :, :] = 1.0
+                        conv.bias.zero_()
+                    for p in conv.parameters(): p.requires_grad = False
+                    self.input_adapter = conv
+                elif adapter_mode == "conv":
                     self.input_adapter = nn.Conv2d(in_channels, 3, 1)
                 else:
                     raise ValueError(f"Unknown adapter_mode: {adapter_mode}")
 
-            self.embed_dim = 768 if "vitb16" in variant.lower() else (1024 if "vitl16" in variant.lower() else 1280)
-            hidden= 256 # 256 384 512
+            # --- embed dim by variant (DINOv3 ViT-* /16) ---
+            v = variant.lower()
+            if "vitb16" in v:   self.embed_dim = 768
+            elif "vitl16" in v: self.embed_dim = 1024
+            elif "vith16" in v or "vith+16" in v: self.embed_dim = 1280
+            else:               self.embed_dim = getattr(self.backbone, "embed_dim", 768)
+
+            # --- token projection + decoder ---
             self.proj = nn.Conv2d(self.embed_dim, hidden, 1)
-            
-            # --- depthwise-separable conv block in nn.Sequential ---
+
             def sepconv_block(ch: int) -> nn.Sequential:
                 return nn.Sequential(
-                    nn.Conv2d(ch, ch, kernel_size=3, padding=1, groups=ch, bias=False),  # depthwise
-                    nn.Conv2d(ch, ch, kernel_size=1, bias=False),                        # pointwise
+                    nn.Conv2d(ch, ch, 3, padding=1, groups=ch, bias=False),  # depthwise
+                    nn.Conv2d(ch, ch, 1, bias=False),                         # pointwise
                     nn.BatchNorm2d(ch),
                     nn.ReLU(inplace=True),
                 )
-            
+
+            # SegFormer-lite style: proj -> [DWConv x 2] -> up x4 with fusions
             self.dec = nn.Sequential(
                 nn.Conv2d(hidden, hidden, 3, padding=1), nn.BatchNorm2d(hidden), nn.ReLU(inplace=True),
-                nn.Conv2d(hidden, hidden, 3, padding=1), nn.BatchNorm2d(hidden), nn.ReLU(inplace=True),
-                
                 sepconv_block(hidden),
                 nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-                
                 sepconv_block(hidden),
                 nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-                
                 sepconv_block(hidden),
                 nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-                
                 sepconv_block(hidden),
-                nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
-
                 nn.Conv2d(hidden, out_channels, 1),
+            )
+
+            # optional dense descriptor head (DINO-style)
+            self.return_dense = return_dense
+            self.norm_dense = norm_dense
+            self.dense_head = nn.Sequential(
+                nn.Conv2d(self.embed_dim, self.embed_dim, 1, bias=False),
+                nn.BatchNorm2d(self.embed_dim),
             )
 
             # freeze control
@@ -521,92 +546,142 @@ class SegmentationModel(pl.LightningModule):
             if freeze_backbone:
                 self.freeze_backbone()
 
-        # ---------- freeze/unfreeze API (internal to the class) ----------
+        # --------- freeze / unfreeze ----------
         def freeze_backbone(self):
-            for p in self.backbone.parameters():
-                p.requires_grad = False
+            for p in self.backbone.parameters(): p.requires_grad = False
             self.is_backbone_frozen = True
-            # keep decoder/head trainable
             self.backbone.eval()
             return self
 
         def unfreeze_backbone(self):
-            for p in self.backbone.parameters():
-                p.requires_grad = True
+            for p in self.backbone.parameters(): p.requires_grad = True
             self.is_backbone_frozen = False
-            if self.training:
-                self.backbone.train()
+            if self.training: self.backbone.train()
             return self
 
-        def schedule_unfreeze(self, epoch:int):
-            """Set an epoch at which you'll call maybe_auto_unfreeze(current_epoch)."""
+        def schedule_unfreeze(self, epoch: int):
             self._auto_unfreeze_epoch = int(epoch)
 
-        def maybe_auto_unfreeze(self, current_epoch:int):
+        def maybe_auto_unfreeze(self, current_epoch: int):
             if self._auto_unfreeze_epoch is not None and current_epoch >= self._auto_unfreeze_epoch:
                 if self.is_backbone_frozen:
                     self.unfreeze_backbone()
 
-        # keep backbone in eval() whenever it's frozen (even if module is set to train)
+        # keep backbone eval() when frozen
         def train(self, mode: bool = True):
             super().train(mode)
             if self.is_backbone_frozen:
                 self.backbone.eval()
+            else:
+                self.backbone.train(mode)
             return self
 
-        # handy param groups for 2-LR optimizers
+        # param groups with proper no-decay split
         def param_groups(self, lr_head: float, lr_backbone: float, weight_decay: float = 0.0):
-            head = list(self.input_adapter.parameters()) + list(self.proj.parameters()) + list(self.dec.parameters())
-            bb   = [p for p in self.backbone.parameters() if p.requires_grad]
-            groups = [{"params": head, "lr": lr_head, "weight_decay": weight_decay}]
-            if bb:
-                groups.append({"params": bb, "lr": lr_backbone, "weight_decay": weight_decay})
+            def named_params(m):
+                for n, p in m.named_parameters():
+                    if p.requires_grad: yield n, p
+
+            def split_decay(named):
+                dec, nodec = [], []
+                for n, p in named:
+                    if p.ndim <= 1 or "bn" in n.lower() or "norm" in n.lower() or "bias" in n.lower():
+                        nodec.append(p)
+                    else:
+                        dec.append(p)
+                return dec, nodec
+
+            head_named = list(named_params(self.input_adapter)) + \
+                        list(named_params(self.proj)) + \
+                        list(named_params(self.dec)) + \
+                        list(named_params(self.dense_head))
+
+            bb_named = list((n, p) for n, p in self.backbone.named_parameters() if p.requires_grad)
+
+            h_dec, h_nodec = split_decay(head_named)
+            groups = [
+                {"params": h_dec,   "lr": lr_head,     "weight_decay": weight_decay},
+                {"params": h_nodec, "lr": lr_head,     "weight_decay": 0.0},
+            ]
+            if bb_named:
+                b_dec, b_nodec = split_decay(bb_named)
+                groups += [
+                    {"params": b_dec,   "lr": lr_backbone, "weight_decay": weight_decay},
+                    {"params": b_nodec, "lr": lr_backbone, "weight_decay": 0.0},
+                ]
             return groups
 
-        # ---------- forward utils ----------
+        # --------- token & shape helpers ----------
         @staticmethod
         def _pad_to_multiple(x, multiple=16):
             H, W = x.shape[-2:]
             ph = (multiple - H % multiple) % multiple
             pw = (multiple - W % multiple) % multiple
-            if ph or pw:
-                x = F.pad(x, (0, pw, 0, ph))
+            if ph or pw: x = F.pad(x, (0, pw, 0, ph))
             return x, (ph, pw)
 
         @staticmethod
         def _unpad(x, pad_hw):
             ph, pw = pad_hw
-            return x[..., : x.shape[-2] - ph if ph else x.shape[-2], : x.shape[-1] - pw if pw else x.shape[-1]]
+            return x[..., : x.shape[-2] - ph if ph else x.shape[-2],
+                    : x.shape[-1] - pw if pw else x.shape[-1]]
 
-        def _tokens_to_grid(self, toks, H, W, patch=16):
+        def _forward_tokens(self, x):
+            """Return [B, N, C] tokens from DINOv3 backbone (robust to dict outputs)."""
+            out = self.backbone.forward_features(x) if hasattr(self.backbone, "forward_features") else self.backbone(x)
+
+            # DINOv3 often returns dict; prefer normalized patch tokens if present
+            if isinstance(out, dict):
+                for k in ("x_norm_patchtokens", "x_norm", "tokens", "x", "x_prenorm"):
+                    if k in out and torch.is_tensor(out[k]):
+                        toks = out[k]
+                        if toks.dim() == 2:  # [B*N, C] (rare)
+                            B = x.shape[0]
+                            toks = toks.view(B, -1, toks.shape[-1])
+                        return toks
+                raise RuntimeError(f"Backbone dict lacks token tensor. Keys: {list(out.keys())}")
+
+            if torch.is_tensor(out) and out.dim() == 3:
+                return out
+
+            raise RuntimeError("Unexpected backbone output (need [B,N,C] or dict).")
+
+        @staticmethod
+        def _tokens_to_grid(toks, H, W, patch=16):
+            # drop CLS if present
             if toks.dim() == 3 and toks.size(1) == (H // patch) * (W // patch) + 1:
                 toks = toks[:, 1:, :]
             B, N, C = toks.shape
             h, w = H // patch, W // patch
+            assert N in (h * w, h * w + 1), f"Unexpected tokens: N={N}, expected {h*w} (+1)"
             return toks.transpose(1, 2).reshape(B, C, h, w)
 
-        def _forward_tokens(self, x):
-            out = self.backbone.forward_features(x) if hasattr(self.backbone, "forward_features") else self.backbone(x)
-            if isinstance(out, dict):
-                for k in ("x", "x_norm_patchtokens", "x_prenorm", "tokens"):
-                    if k in out:
-                        return out[k]
-                raise RuntimeError("Backbone dict lacks token tensor.")
-            if torch.is_tensor(out) and out.dim() == 3:
-                return out
-            raise RuntimeError("Unexpected backbone output (expected [B,N,C] tokens or dict).")
-
+        # --------- forward ----------
         def forward(self, x):
             x = self.input_adapter(x)
             x, pad_hw = self._pad_to_multiple(x, 16)
             H, W = x.shape[-2:]
-            toks = self._forward_tokens(x)                   # [B, N(+1), C]
-            grid = self._tokens_to_grid(toks, H, W, 16)      # [B, C, H/16, W/16]
-            logits = self.dec(self.proj(grid))            # [B, out_ch, H/16, W/16]
-            oB,oC,oH,oW = logits.shape
-            if oH!=H and W!=oW:
+
+            toks = self._forward_tokens(x)                 # [B, N(+1), C]
+            grid = self._tokens_to_grid(toks, H, W, 16)    # [B, C, H/16, W/16]
+
+            # dense features (before proj/decoder); optionally L2-normalize DINO
+            dense = self.dense_head(grid)
+            if self.norm_dense:
+                dense = F.normalize(dense.float(), dim=1).type_as(dense)
+
+            if self.return_dense:
+                return self._unpad(dense,  pad_hw)
+
+            # segmentation decoder
+            logits = self.dec(self.proj(grid))             # [B, out_ch, H/16 * 8, W/16 * 8] ≈ H/2, W/2
+            oB, oC, oH, oW = logits.shape
+            if (oH != H) or (oW != W):
                 logits = F.interpolate(logits, size=(H, W), mode="bilinear", align_corners=False)
-            return self._unpad(logits, pad_hw)
+            return logits
+            # logits = self._unpad(logits, pad_hw)
+            # dense  = self._unpad(dense,  pad_hw)
+            # return {"logits": logits, "dense": dense if self.return_dense else None}
         
     class BCEDiceLoss(nn.Module):
         def __init__(self, bce_weight=0.5, dice_weight=0.5):
